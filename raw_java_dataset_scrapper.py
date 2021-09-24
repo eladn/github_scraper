@@ -10,7 +10,7 @@ from itertools import count
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs, urlunparse
-from typing import Dict, List, AsyncIterable, Optional, Union
+from typing import Dict, List, AsyncIterable, Optional, Union, Iterable
 
 import aiohttp
 import aiofile
@@ -164,7 +164,7 @@ class RawJavaDatasetGitHubScrapper:
         self.concurrent_fs_io_processes_sem = asyncio.BoundedSemaphore(max_nr_concurrent_fs_ios)
 
     def is_repo_considered_popular(self, repo_info: GithubRepositoryInfo) -> bool:
-        repo_info_min_requirement = GithubRepositoryInfo(
+        repo_info_relaxed_conditions = GithubRepositoryInfo(
             nr_contributors=None,
             nr_stars=40,
             nr_commits=3000,
@@ -175,34 +175,61 @@ class RawJavaDatasetGitHubScrapper:
             network_count=None,
             subscribers_count=None,
             java_language_freq=0.7,
-            last_commits_avg_time_delta=datetime.timedelta(days=-60),
+            last_commits_avg_time_delta=datetime.timedelta(days=-4*30),
             default_branch=None
         )
-        repo_info_popularity_requirement = GithubRepositoryInfo(
+        repo_info_moderate_conditions = GithubRepositoryInfo(
+            nr_contributors=20,
+            nr_stars=75,
+            nr_commits=4500,
+            nr_tags=15,
+            nr_forks=40,
+            nr_branches=15,
+            nr_watchers=50,
+            network_count=None,
+            subscribers_count=None,
+            java_language_freq=None,
+            last_commits_avg_time_delta=datetime.timedelta(days=-1.5*30),
+            default_branch=None
+        )
+        repo_info_strict_conditions = GithubRepositoryInfo(
             nr_contributors=50,
-            nr_stars=100,
-            nr_commits=5000,
+            nr_stars=200,
+            nr_commits=7000,
             nr_tags=30,
             nr_forks=100,
             nr_branches=30,
             nr_watchers=100,
-            network_count=20,
-            subscribers_count=100,
+            network_count=None,
+            subscribers_count=None,
             java_language_freq=None,
             last_commits_avg_time_delta=datetime.timedelta(days=-5),
             default_branch=None
         )
-        is_repo_valid = all(
-            getattr(repo_info, field.name) >= getattr(repo_info_min_requirement, field.name)
-            for field in dataclasses.fields(repo_info_min_requirement)
-            if getattr(repo_info, field.name) is not None and
-            isinstance(getattr(repo_info_min_requirement, field.name), (int, float, datetime.timedelta)))
-        is_repo_exceptional = any(
-            getattr(repo_info, field.name) >= getattr(repo_info_popularity_requirement, field.name)
-            for field in dataclasses.fields(repo_info_popularity_requirement)
-            if getattr(repo_info, field.name) is not None and
-            isinstance(getattr(repo_info_popularity_requirement, field.name), (int, float, datetime.timedelta)))
-        is_repo_popular = is_repo_valid and is_repo_exceptional
+
+        def check_conditions(conditions: GithubRepositoryInfo) -> Iterable[bool]:
+            return (
+                getattr(repo_info, field.name) >= getattr(conditions, field.name)
+                for field in dataclasses.fields(conditions)
+                if getattr(repo_info, field.name) is not None and
+                getattr(conditions, field.name) is not None and
+                isinstance(getattr(conditions, field.name), (int, float, datetime.timedelta)))
+
+        def mean(data):
+            n, mean_accumulator = 0, 0.0
+            for x in data:
+                n += 1
+                mean_accumulator += (x - mean_accumulator) / n
+            if n < 1:
+                return float('nan')
+            else:
+                return mean_accumulator
+
+        relaxed_conjunction = all(check_conditions(repo_info_relaxed_conditions))
+        strict_disjunction = all(check_conditions(repo_info_strict_conditions))
+        moderate_majority = mean(check_conditions(repo_info_moderate_conditions)) > 0.5 - sys.float_info.epsilon
+        is_repo_popular = \
+            mean((relaxed_conjunction, strict_disjunction, moderate_majority)) > 0.5 - sys.float_info.epsilon
         # print('is_repo_popular', is_repo_popular)
         return is_repo_popular
 
@@ -403,16 +430,17 @@ class RawJavaDatasetGitHubScrapper:
             'repo_languages_dict': self._json_api_call(f'{api_info_req_url}/languages'),
             'repo_nr_contributors': self.get_repository_nr_contributors(
                 owner_name=owner_name, repository_name=repository_name),
-            # 'repo_nr_tags': self.get_repository_nr_tags(
-            #     owner_name=owner_name, repository_name=repository_name),
+            'repo_nr_tags': self.get_repository_nr_tags(
+                owner_name=owner_name, repository_name=repository_name),
             'repo_last_commits': self._paginated_list_api_call(f'{api_info_req_url}/commits', max_nr_items=20),
             'repo_nr_commits': self.get_repository_nr_commits(
                 owner_name=owner_name, repository_name=repository_name),
-            # 'repo_nr_branches': self.get_repository_nr_branches(
-            #     owner_name=owner_name, repository_name=repository_name)
+            'repo_nr_branches': self.get_repository_nr_branches(
+                owner_name=owner_name, repository_name=repository_name)
         }
         if repo_dict is None:
-            requests_coroutines['repo_info_dict'] = self._json_api_call(api_info_req_url)
+            requests_coroutines['repo_info_dict'] = self.get_repository_data(
+                owner_name=owner_name, repository_name=repository_name)
         # invoke all together and wait for all to finish
         requests_tasks = {name: asyncio.create_task(coroutine) for name, coroutine in requests_coroutines.items()}
         await asyncio.gather(*requests_tasks.values())
@@ -420,10 +448,10 @@ class RawJavaDatasetGitHubScrapper:
         repo_info_dict = responses['repo_info_dict'] if 'repo_info_dict' in responses else repo_dict
         repo_languages_dict = responses['repo_languages_dict']
         repo_nr_contributors = responses['repo_nr_contributors']
-        # repo_nr_tags = responses['repo_nr_tags']
+        repo_nr_tags = responses['repo_nr_tags']
         repo_last_commits = responses['repo_last_commits']
         repo_nr_commits = responses['repo_nr_commits']
-        # repo_nr_branches = responses['repo_nr_branches']
+        repo_nr_branches = responses['repo_nr_branches']
 
         last_commits_datetimes = [
             datetime.datetime.strptime(commit['commit']['committer']['date'], "%Y-%m-%dT%H:%M:%SZ")
@@ -441,11 +469,11 @@ class RawJavaDatasetGitHubScrapper:
             nr_contributors=repo_nr_contributors,
             nr_stars=repo_info_dict['stargazers_count'],
             nr_commits=repo_nr_commits,
-            # nr_tags=repo_nr_tags,
-            nr_tags=None,
+            nr_tags=repo_nr_tags,
+            # nr_tags=None,
             nr_forks=repo_info_dict['forks_count'],
-            # nr_branches=repo_nr_branches,
-            nr_branches=None,
+            nr_branches=repo_nr_branches,
+            # nr_branches=None,
             nr_watchers=repo_info_dict['watchers_count'],
             network_count=None,  #repo_info_dict['network_count'],
             subscribers_count=None,  #repo_info_dict['subscribers_count'],
@@ -465,10 +493,31 @@ class RawJavaDatasetGitHubScrapper:
             await asyncio.sleep(1)
         await asyncio.gather(*tasks)
 
+    async def get_repository_data(self, owner_name: str, repository_name: str) -> dict:
+        api_repo_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
+        repo_dict = await self._json_api_call(api_repo_info_req_url)
+        return repo_dict
+
+    async def iterate_repositories_data(self, owner_name: str, repository_names: List[str]) -> AsyncIterable[dict]:
+        for repository_name in repository_names:
+            repo_dict = await self.get_repository_data(owner_name=owner_name, repository_name=repository_name)
+            if repo_dict is None:
+                raise RuntimeError(f'Could not find repository {owner_name}/{repository_name}.')
+            yield repo_dict
+
     async def scrape_and_prepare_owner(
-            self, owner_name: str, output_dir_path: str, popularity_check: bool = True):
+            self, owner_name: str,
+            output_dir_path: str,
+            popularity_check: bool = True,
+            repository_names: Optional[List[str]] = None):
         tasks = []
-        async for repository_dict in self.find_all_java_repositories_of_owner(owner_name=owner_name):
+
+        repositories_iterator = \
+            self.find_all_java_repositories_of_owner(owner_name=owner_name) \
+                if repository_names is None else \
+                self.iterate_repositories_data(owner_name=owner_name, repository_names=repository_names)
+
+        async for repository_dict in repositories_iterator:
             if popularity_check:
                 tasks.append(asyncio.create_task(self.scrape_and_prepare_repository_if_popular(
                     owner_name=owner_name, repository_name=repository_dict['name'],
@@ -574,9 +623,18 @@ async def async_main():
     args = parser.parse_args()
     scrapper = RawJavaDatasetGitHubScrapper(user=args.user, token=args.token)
     try:
-        await scrapper.scrape_and_prepare_owners(
-            owner_names=args.owner_names, output_dir_path=args.output_dir_path,
-            popularity_check=not args.no_popularity_check)
+        if args.repository_names is None:
+            await scrapper.scrape_and_prepare_owners(
+                owner_names=args.owner_names,
+                output_dir_path=args.output_dir_path,
+                popularity_check=not args.no_popularity_check)
+        else:
+            assert len(args.owner_names) == 1
+            await scrapper.scrape_and_prepare_owner(
+                owner_name=args.owner_names[0],
+                repository_names=args.repository_names,
+                output_dir_path=args.output_dir_path,
+                popularity_check=not args.no_popularity_check)
     finally:
         await scrapper.close()
 
@@ -590,6 +648,7 @@ def sync_main():
 def create_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument('--owners', type=str, required=True, nargs='+', dest='owner_names')
+    parser.add_argument('--repos', type=str, required=False, nargs='+', dest='repository_names')
     parser.add_argument('--no-popularity-check', action='store_true', dest='no_popularity_check')
     parser.add_argument('--output-dir', type=str, required=True, dest='output_dir_path')
     parser.add_argument('--user', type=str, dest='user')
