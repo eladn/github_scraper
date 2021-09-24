@@ -8,6 +8,7 @@ import dataclasses
 from warnings import warn
 from itertools import count
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs, urlunparse
 from typing import Dict, List, AsyncIterable, Optional, Union
 
@@ -41,6 +42,10 @@ async def _async_copy_file(source_file_path: str, dest_file_path: str, chunk_siz
             aiofile.async_open(dest_file_path, "wb") as dest:
         async for chunk in src.iter_chunked(chunk_size):
             await dest.write(chunk)
+
+
+async def _dummy_coroutine(result):
+    return result
 
 
 class SessionAgent:
@@ -93,6 +98,7 @@ class SessionAgent:
         self.concurrent_api_requests_sem.release()
         return False
 
+    @asynccontextmanager
     async def request(self, url, method='get', json: bool = False, body=None, headers=None):
         for attempt_nr in range(self.max_nr_attempts):
             if attempt_nr > 0:
@@ -114,12 +120,14 @@ class SessionAgent:
                     if json:
                         try:
                             json = await response.json()
-                            return response, json
+                            yield response, json
+                            return
                         except:
                             break  # like "continue" for outer loop - counts as a failed attempt
                     else:
-                        return response
-        return None
+                        yield response
+                        return
+        return
 
 
 class RawJavaDatasetGitHubScrapper:
@@ -217,10 +225,10 @@ class RawJavaDatasetGitHubScrapper:
     async def _get_nr_pages_for_paginated_api_call(self, api_req_url: str) -> Optional[int]:
         first_page_url = self._get_url_for_page(
             api_req_url=api_req_url, page_size=1, page_nr=1)
-        first_page_res = await self._api_call(first_page_url)
-        if first_page_res is None:
-            return None
-        return self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res) + 1
+        async with self._api_call(first_page_url) as first_page_res:
+            if first_page_res is None:
+                return None
+            return self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res) + 1
 
     async def _paginated_list_api_call(
             self, api_req_url: str,
@@ -261,10 +269,14 @@ class RawJavaDatasetGitHubScrapper:
                         return
         else:
             assert nr_pages_prefetch > 0
-            first_page_res_task = asyncio.create_task(self._api_call(self._get_url_for_page(
-                api_req_url=api_req_url, page_size=page_size, page_nr=1)))
-            first_page_res = await first_page_res_task
-            last_page_nr = self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res)
+            first_page_url = self._get_url_for_page(api_req_url=api_req_url, page_size=page_size, page_nr=1)
+            async with self._api_call(first_page_url, json=True) as first_page_ret:
+                if first_page_ret is None:
+                    raise RuntimeError(f'Could not fetch first page.')
+                first_page_res, first_page_json = first_page_ret
+                last_page_nr = self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res)
+                first_page_res_task = asyncio.create_task(_dummy_coroutine(first_page_json))
+
             if max_nr_items is not None:
                 last_page_nr = min(last_page_nr, int(math.ceil(max_nr_items / page_size)))
             pages_tasks: Dict[int, asyncio.Task] = {1: first_page_res_task}
@@ -279,31 +291,17 @@ class RawJavaDatasetGitHubScrapper:
                             api_req_url=api_req_url, page_size=page_size, page_nr=page_nr_to_prefetch)))
                 assert page_nr in pages_tasks
                 page_task = pages_tasks[page_nr]
-                page_res = page_task.result() if page_task.done() else await page_task  # avoid awaiting twice
-                if page_res is None:
+                page_json_res = page_task.result() if page_task.done() else await page_task  # avoid awaiting twice
+                if page_json_res is None:
                     # Prefetch failed (maybe too many attempts). Here we give it a second change.
-                    page_res = await self._json_api_call(self._get_url_for_page(
+                    page_json_res = await self._json_api_call(self._get_url_for_page(
                         api_req_url=api_req_url, page_size=page_size, page_nr=page_nr))
-                    if page_res is None:
+                    if page_json_res is None:
                         raise RuntimeError(f'Could not fetch page {page_nr}.')
-                # The first page result is a response (we needed the header) - handle it correctly.
-                if isinstance(page_res, aiohttp.ClientResponse):
-                    assert page_nr == 1
-                    try:
-                        res_json = await page_res.json()
-                    except:
-                        page_res = await self._json_api_call(self._get_url_for_page(
-                            api_req_url=api_req_url, page_size=page_size, page_nr=page_nr))
-                        if page_res is None:
-                            raise RuntimeError(f'Could not fetch page {page_nr}.')
-                        res_json = page_res
-                else:
-                    res_json = page_res
-                # res_json = await page_res.json() if isinstance(page_res, aiohttp.ClientResponse) else page_res
-                assert res_json is not None
-                assert isinstance(res_json, list)
-                assert len(res_json) > 0
-                for item in res_json:
+                assert page_json_res is not None
+                assert isinstance(page_json_res, list)
+                assert len(page_json_res) > 0
+                for item in page_json_res:
                     nr_yielded_items += 1
                     yield item
                     if max_nr_items is not None and nr_yielded_items >= max_nr_items:
@@ -311,11 +309,11 @@ class RawJavaDatasetGitHubScrapper:
 
     async def _get_item_by_index_from_paginated_list_api_call(
             self, api_req_url: str, item_index: int) -> Optional[Union[dict, list]]:
-        first_page_res = await self._api_call(self._get_url_for_page(
-            api_req_url=api_req_url, page_size=1, page_nr=1))
-        if first_page_res is None:
-            return None
-        last_page_nr = self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res)
+        async with self._api_call(self._get_url_for_page(
+                api_req_url=api_req_url, page_size=1, page_nr=1)) as first_page_res:
+            if first_page_res is None:
+                return None
+            last_page_nr = self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res)
         wanted_page_nr = last_page_nr - item_index
         assert wanted_page_nr >= 1
         wanted_page_res = await self._json_api_call(self._get_url_for_page(
@@ -325,22 +323,22 @@ class RawJavaDatasetGitHubScrapper:
         return wanted_page_res[0]
 
     async def _json_api_call(self, api_req_url: str) -> Optional[Union[list, dict]]:
-        ret = await self.api_session_agent.request(api_req_url, json=True)
-        if ret is None:
-            # TODO: what do we do in this case?
-            return None
-        print('successful json api request')
-        resp, json = ret
-        return json
+        async with self.api_session_agent.request(api_req_url, json=True) as ret:
+            if ret is None:
+                return None
+            print('successful json api request')
+            resp, json = ret
+            return json
 
-    async def _api_call(self, api_req_url: str) -> Optional[aiohttp.ClientResponse]:
-        response = await self.api_session_agent.request(api_req_url)
-        if response is None:
-            # TODO: what do we do in this case?
-            pass
-        if response is not None:
+    @asynccontextmanager
+    async def _api_call(self, api_req_url: str, json: bool = False) -> Optional[aiohttp.ClientResponse]:
+        async with self.api_session_agent.request(api_req_url, json=json) as ret:
+            if ret is None:
+                # TODO: what do we do in this case?
+                yield None
+                return
             print('successful api request')
-        return response
+            yield ret
 
     async def _get_repository_nr_commits_old(self, owner_name: str, repository_name: str) -> int:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
@@ -496,17 +494,17 @@ class RawJavaDatasetGitHubScrapper:
             self, owner_name: str, repository_name: str, branch_name: str,
             target_dir_path: str, chunk_size: int = 65535):
         repo_zip_file_url = f'https://github.com/{owner_name}/{repository_name}/archive/{branch_name}.zip'
-        response = await self.downloads_session_agent.request(repo_zip_file_url)
-        if response is None:
-            pass
-        print('successful file download')
-        zip_file_path = os.path.join(target_dir_path, f'{repository_name}.zip')
-        async with aiofiles.open(zip_file_path, mode='wb') as zip_file:
-            while True:
-                chunk = await response.content.read(chunk_size)
-                if not chunk:
-                    break
-                await zip_file.write(chunk)
+        async with self.downloads_session_agent.request(repo_zip_file_url) as response:
+            if response is None:
+                raise RuntimeError(f'Could not download repository {owner_name}/{repository_name}:{branch_name}.')
+            zip_file_path = os.path.join(target_dir_path, f'{repository_name}.zip')
+            async with aiofiles.open(zip_file_path, mode='wb') as zip_file:
+                while True:
+                    chunk = await response.content.read(chunk_size)
+                    if not chunk:
+                        break
+                    await zip_file.write(chunk)
+            print('successful file download')
         unzip_proc = await asyncio.create_subprocess_exec(
             'unzip', '-o', zip_file_path, '-d', target_dir_path,
             stdout=asyncio.subprocess.DEVNULL,
@@ -531,7 +529,7 @@ class RawJavaDatasetGitHubScrapper:
         await asyncio.gather(*tasks)
 
     async def close(self):
-        await asyncio.gather((
+        await asyncio.gather(*(
             asyncio.create_task(self.api_session_agent.close_session_if_opened()),
             asyncio.create_task(self.downloads_session_agent.close_session_if_opened())))
 
