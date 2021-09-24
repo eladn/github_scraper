@@ -22,17 +22,17 @@ from aiopath import AsyncPath
 
 @dataclasses.dataclass(frozen=True)
 class GithubRepositoryInfo:
-    nr_contributors: int
-    nr_stars: int
-    nr_commits: int
-    nr_tags: int
-    nr_forks: int
-    nr_branches: int
-    nr_watchers: int
-    network_count: int
-    subscribers_count: int
-    java_language_freq: float
-    last_commits_avg_time_delta: datetime.timedelta
+    nr_contributors: Optional[int]
+    nr_stars: Optional[int]
+    nr_commits: Optional[int]
+    nr_tags: Optional[int]
+    nr_forks: Optional[int]
+    nr_branches: Optional[int]
+    nr_watchers: Optional[int]
+    network_count: Optional[int]
+    subscribers_count: Optional[int]
+    java_language_freq: Optional[float]
+    last_commits_avg_time_delta: Optional[datetime.timedelta]
     default_branch: str
 
 
@@ -48,11 +48,11 @@ class RawJavaDatasetGitHubScrapper:
             self, user: Optional[str] = None,
             token: Optional[str] = None,
             max_nr_concurrent_api_requests: int = 5):
-        self.auth = aiohttp.BasicAuth(user, token) if user and token else None
+        self.api_auth = aiohttp.BasicAuth(user, token) if user and token else None
         self.is_under_limit = False
         self.under_limit_wake_up_events = []
         self.concurrent_api_requests_sem = asyncio.BoundedSemaphore(max_nr_concurrent_api_requests)
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session: Dict[str, aiohttp.ClientSession] = {}
 
     NR_ATTEMPTS: int = 5
 
@@ -74,8 +74,17 @@ class RawJavaDatasetGitHubScrapper:
         is_repo_popular = all(
             getattr(repo_info, field.name) >= getattr(repo_info_min_requirement, field.name)
             for field in dataclasses.fields(repo_info_min_requirement)
-            if isinstance(getattr(repo_info_min_requirement, field.name), (int, float)))
+            if getattr(repo_info, field.name) is not None and
+            isinstance(getattr(repo_info_min_requirement, field.name), (int, float, datetime.timedelta)))
+        # print('is_repo_popular', is_repo_popular)
         return is_repo_popular
+
+    async def find_all_java_repositories_of_owner(self, owner_name: str) -> AsyncIterable[dict]:
+        api_repos_req_url = f'https://api.github.com/orgs/{owner_name}/repos'
+        async for repo_dict in self._paginated_iterator_api_call(api_repos_req_url):
+            assert 'name' in repo_dict and 'language' in repo_dict
+            if repo_dict['language'] and repo_dict['language'].lower() == 'java':
+                yield repo_dict
 
     async def find_all_java_repositories_names_of_owner(self, owner_name: str) -> AsyncIterable[str]:
         api_repos_req_url = f'https://api.github.com/orgs/{owner_name}/repos'
@@ -97,14 +106,17 @@ class RawJavaDatasetGitHubScrapper:
         return api_req_url_for_cur_page
 
     def _extract_nr_pages_from_paginated_list_api_call_response(self, response: aiohttp.ClientResponse) -> int:
+        if 'Link' not in response.headers:
+            return 1
         last_page_url = response.headers.get('Link').split(',')[1].split(';')[0].split('<')[1].split('>')[0]
         last_page_nr = int(parse_qs(urlparse(last_page_url).query)['page'][0])
         assert last_page_nr >= 1
         return last_page_nr
 
     async def _get_nr_pages_for_paginated_api_call(self, api_req_url: str) -> Optional[int]:
-        first_page_res = await self._api_call(self._get_url_for_page(
-            api_req_url=api_req_url, page_size=1, page_nr=1))
+        first_page_url = self._get_url_for_page(
+            api_req_url=api_req_url, page_size=1, page_nr=1)
+        first_page_res = await self._api_call(first_page_url)
         if first_page_res is None:
             return None
         return self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res) + 1
@@ -237,20 +249,31 @@ class RawJavaDatasetGitHubScrapper:
         self.under_limit_wake_up_events.append(wake_up_events)
         await wake_up_events.wait()
 
-    async def create_session(self):
-        await self.close_session_if_opened()
-        self.session = aiohttp.ClientSession(auth=self.auth)
+    async def create_session(self, session_name: str, auth: Optional[aiohttp.BasicAuth] = None):
+        await self.close_session_if_opened(session_name=session_name)
+        self.session[session_name] = aiohttp.ClientSession(auth=auth)
 
-    async def close_session_if_opened(self):
-        old_session = self.session
-        self.session = None
-        if old_session is not None:
-            await old_session.close()
+    async def get_session(self, session_name: str, auth: Optional[aiohttp.BasicAuth] = None) -> aiohttp.ClientSession:
+        while session_name not in self.session:
+            await self.create_session(session_name=session_name, auth=auth)
+        return self.session[session_name]
 
-    async def get_session(self):
-        if self.session is None:
-            await self.create_session()
-        return self.session
+    async def close_session_if_opened(self, session_name: str):
+        if session_name not in self.session:
+            return
+        old_session = self.session.pop(session_name)
+        await old_session.close()
+
+    async def close_opened_sessions(self):
+        opened_sessions = tuple(self.session.keys())
+        for session_name in opened_sessions:
+            await self.close_session_if_opened(session_name=session_name)
+
+    async def get_api_session(self) -> aiohttp.ClientSession:
+        return await self.get_session(session_name='api', auth=self.api_auth)
+
+    async def get_general_session(self) -> aiohttp.ClientSession:
+        return await self.get_session(session_name='general')
 
     async def _json_api_call(self, api_req_url: str) -> Optional[Union[list, dict]]:
         for attempt_nr in range(self.NR_ATTEMPTS):
@@ -258,7 +281,7 @@ class RawJavaDatasetGitHubScrapper:
                 await asyncio.sleep(5 * attempt_nr)
             while True:
                 await self._api_call_limit_fence()
-                session = await self.get_session()
+                session = await self.get_api_session()
                 async with session.get(api_req_url) as response:
                     limit_ok = await self._api_call_limit_check(response.status)
                     if not limit_ok:
@@ -279,7 +302,7 @@ class RawJavaDatasetGitHubScrapper:
                 await asyncio.sleep(5 * attempt_nr)
             while True:
                 await self._api_call_limit_fence()
-                session = await self.get_session()
+                session = await self.get_api_session()
                 async with session.get(api_req_url) as response:
                     limit_ok = await self._api_call_limit_check(response.status)
                     if not limit_ok:
@@ -327,32 +350,35 @@ class RawJavaDatasetGitHubScrapper:
             return None
         return repo_info_dict['default_branch']
 
-    async def get_repository_info(self, owner_name: str, repository_name: str) -> Optional[GithubRepositoryInfo]:
+    async def get_repository_info(
+            self, owner_name: str, repository_name: str,
+            repo_dict: Optional[dict] = None) -> Optional[GithubRepositoryInfo]:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
         requests_coroutines = {
-            'repo_info_dict': self._json_api_call(api_info_req_url),
             'repo_languages_dict': self._json_api_call(f'{api_info_req_url}/languages'),
             'repo_nr_contributors': self.get_repository_nr_contributors(
                 owner_name=owner_name, repository_name=repository_name),
-            'repo_nr_tags': self.get_repository_nr_tags(
-                owner_name=owner_name, repository_name=repository_name),
+            # 'repo_nr_tags': self.get_repository_nr_tags(
+            #     owner_name=owner_name, repository_name=repository_name),
             'repo_last_commits': self._paginated_list_api_call(f'{api_info_req_url}/commits', max_nr_items=20),
             'repo_nr_commits': self.get_repository_nr_commits(
                 owner_name=owner_name, repository_name=repository_name),
-            'repo_nr_branches': self.get_repository_nr_branches(
-                owner_name=owner_name, repository_name=repository_name)
+            # 'repo_nr_branches': self.get_repository_nr_branches(
+            #     owner_name=owner_name, repository_name=repository_name)
         }
+        if repo_dict is None:
+            requests_coroutines['repo_info_dict'] = self._json_api_call(api_info_req_url)
         # invoke all together and wait for all to finish
         requests_tasks = {name: asyncio.create_task(coroutine) for name, coroutine in requests_coroutines.items()}
         await asyncio.gather(*requests_tasks.values())
         responses = {name: task.result() for name, task in requests_tasks.items()}
-        repo_info_dict = responses['repo_info_dict']
+        repo_info_dict = responses['repo_info_dict'] if 'repo_info_dict' in responses else repo_dict
         repo_languages_dict = responses['repo_languages_dict']
         repo_nr_contributors = responses['repo_nr_contributors']
-        repo_nr_tags = responses['repo_nr_tags']
+        # repo_nr_tags = responses['repo_nr_tags']
         repo_last_commits = responses['repo_last_commits']
         repo_nr_commits = responses['repo_nr_commits']
-        repo_nr_branches = responses['repo_nr_branches']
+        # repo_nr_branches = responses['repo_nr_branches']
 
         last_commits_datetimes = [
             datetime.datetime.strptime(commit['commit']['committer']['date'], "%Y-%m-%dT%H:%M:%SZ")
@@ -360,7 +386,6 @@ class RawJavaDatasetGitHubScrapper:
         last_commits_dates_avg_datetime = datetime.datetime.fromtimestamp(
             sum(map(datetime.datetime.timestamp, last_commits_datetimes)) / len(last_commits_datetimes))
         last_commits_avg_time_delta = last_commits_dates_avg_datetime - datetime.datetime.today()
-
         if repo_info_dict is None:
             return None
         if repo_languages_dict is None:
@@ -371,12 +396,14 @@ class RawJavaDatasetGitHubScrapper:
             nr_contributors=repo_nr_contributors,
             nr_stars=repo_info_dict['stargazers_count'],
             nr_commits=repo_nr_commits,
-            nr_tags=repo_nr_tags,
+            # nr_tags=repo_nr_tags,
+            nr_tags=None,
             nr_forks=repo_info_dict['forks_count'],
-            nr_branches=repo_nr_branches,
+            # nr_branches=repo_nr_branches,
+            nr_branches=None,
             nr_watchers=repo_info_dict['watchers_count'],
-            network_count=repo_info_dict['network_count'],
-            subscribers_count=repo_info_dict['subscribers_count'],
+            network_count=None,  #repo_info_dict['network_count'],
+            subscribers_count=None,  #repo_info_dict['subscribers_count'],
             java_language_freq=java_language_freq,
             last_commits_avg_time_delta=last_commits_avg_time_delta,
             default_branch=repo_info_dict['default_branch']
@@ -384,38 +411,45 @@ class RawJavaDatasetGitHubScrapper:
 
     async def scrape_and_prepare_owners(
             self, owner_names: List[str], output_dir_path: str, popularity_check: bool = True):
-        await asyncio.gather(*(
-            self.scrape_and_prepare_owner(
-                owner_name=owner_name, output_dir_path=output_dir_path, popularity_check=popularity_check)
-            for owner_name in owner_names
-        ))
+        tasks = []
+        for owner_name in owner_names:
+            tasks.append(asyncio.create_task(self.scrape_and_prepare_owner(
+                owner_name=owner_name, output_dir_path=output_dir_path, popularity_check=popularity_check)))
+            # Yield to avoid starving of sub-tasks. Prefer depth-first work-order scheduling over breadth-first.
+            # Namely, allow download of the 1st project before finishing scraping data on all projects.
+            await asyncio.sleep(1)
+        await asyncio.gather(*tasks)
 
     async def scrape_and_prepare_owner(
             self, owner_name: str, output_dir_path: str, popularity_check: bool = True):
-        if popularity_check:
-            tasks = [
-                asyncio.create_task(self.scrape_and_prepare_repository_if_popular(
-                    owner_name=owner_name, repository_name=repository_name, output_dir_path=output_dir_path))
-                async for repository_name in self.find_all_java_repositories_names_of_owner(owner_name=owner_name)
-            ]
-        else:
-            tasks = [
-                asyncio.create_task(self.scrape_and_prepare_repository(
-                    owner_name=owner_name, repository_name=repository_name, output_dir_path=output_dir_path))
-                async for repository_name in self.find_all_java_repositories_names_of_owner(owner_name=owner_name)
-            ]
+        tasks = []
+        async for repository_dict in self.find_all_java_repositories_of_owner(owner_name=owner_name):
+            if popularity_check:
+                tasks.append(asyncio.create_task(self.scrape_and_prepare_repository_if_popular(
+                    owner_name=owner_name, repository_name=repository_dict['name'],
+                    output_dir_path=output_dir_path, repository_dict=repository_dict)))
+            else:
+                tasks.append(asyncio.create_task(self.scrape_and_prepare_repository(
+                    owner_name=owner_name, repository_name=repository_dict['name'],
+                    output_dir_path=output_dir_path, branch_name=repository_dict['default_branch'])))
+            # Yield to avoid starving of sub-tasks. Prefer depth-first work-order scheduling over breadth-first.
+            # Namely, allow download of the 1st project before finishing scraping data on all projects.
+            await asyncio.sleep(1)
         await asyncio.gather(*tasks)
 
     async def scrape_and_prepare_repository_if_popular(
-            self, owner_name: str, repository_name: str, output_dir_path: str):
-        repo_info = await self.get_repository_info(owner_name=owner_name, repository_name=repository_name)
-        if self.is_repo_considered_popular(repo_info=repo_info):
+            self, owner_name: str, repository_name: str, output_dir_path: str,
+            repository_dict: Optional[dict] = None):
+        repository_info = await self.get_repository_info(
+            owner_name=owner_name, repository_name=repository_name, repo_dict=repository_dict)
+        if self.is_repo_considered_popular(repo_info=repository_info):
             await self.scrape_and_prepare_repository(
                 owner_name=owner_name, repository_name=repository_name,
-                branch_name=repo_info.default_branch, output_dir_path=output_dir_path)
+                branch_name=repository_info.default_branch, output_dir_path=output_dir_path)
 
     async def scrape_and_prepare_repository(
-            self, owner_name: str, repository_name: str, output_dir_path: str, branch_name: Optional[str] = None):
+            self, owner_name: str, repository_name: str, output_dir_path: str,
+            branch_name: Optional[str] = None):
         if branch_name is None:
             branch_name = await self.get_repository_default_branch(
                 owner_name=owner_name, repository_name=repository_name)
@@ -430,14 +464,15 @@ class RawJavaDatasetGitHubScrapper:
                 look_in_dir_path=tmp_dir, tgt_dir_path=repo_output_dir)
 
     async def clone_repository(
-            self, owner_name: str, repository_name: str, branch_name: str, target_dir_path: str):
+            self, owner_name: str, repository_name: str, branch_name: str,
+            target_dir_path: str, chunk_size: int = 65535):
         repo_zip_file_url = f'https://github.com/{owner_name}/{repository_name}/archive/{branch_name}.zip'
         for attempt_nr in range(self.NR_ATTEMPTS):
             if attempt_nr > 0:
                 await asyncio.sleep(5 * attempt_nr)
             while True:
                 await self._api_call_limit_fence()
-                session = await self.get_session()
+                session = await self.get_general_session()
                 async with session.get(repo_zip_file_url) as response:
                     limit_ok = await self._api_call_limit_check(response.status)
                     if not limit_ok:
@@ -446,9 +481,12 @@ class RawJavaDatasetGitHubScrapper:
                         break  # like "continue" for outer loop - counts as a failed attempt
                     print('successful file download')
                     zip_file_path = os.path.join(target_dir_path, f'{repository_name}.zip')
-                    zip_file = await aiofiles.open(zip_file_path, mode='wb')
-                    await zip_file.write(await response.read())
-                    await zip_file.close()
+                    async with aiofiles.open(zip_file_path, mode='wb') as zip_file:
+                        while True:
+                            chunk = await response.content.read(chunk_size)
+                            if not chunk:
+                                break
+                            await zip_file.write(chunk)
                     unzip_proc = await asyncio.create_subprocess_exec(
                         'unzip', '-o', zip_file_path, '-d', target_dir_path,
                         stdout=asyncio.subprocess.DEVNULL,
@@ -482,7 +520,7 @@ async def async_main():
             owner_names=args.owner_names, output_dir_path=args.output_dir_path,
             popularity_check=not args.no_popularity_check)
     finally:
-        await scrapper.close_session_if_opened()
+        await scrapper.close_opened_sessions()
 
 
 def sync_main():
