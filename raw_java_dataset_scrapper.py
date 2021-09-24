@@ -37,11 +37,18 @@ class GithubRepositoryInfo:
     default_branch: Optional[str]
 
 
-async def _async_copy_file(source_file_path: str, dest_file_path: str, chunk_size: int = 65535):
-    async with aiofile.async_open(source_file_path, "rb") as src, \
-            aiofile.async_open(dest_file_path, "wb") as dest:
-        async for chunk in src.iter_chunked(chunk_size):
-            await dest.write(chunk)
+class IOFileHelper:
+    def __init__(self, max_nr_concurrent_operations: int):
+        self.concurrent_operations_sem = asyncio.BoundedSemaphore(max_nr_concurrent_operations)
+
+    async def async_copy_file(self, source_file_path: str, dest_file_path: str, chunk_size: int = 65535):
+        # We avoid making too many concurrent IOs to FS.
+        await self.concurrent_operations_sem.acquire()
+        async with aiofile.async_open(source_file_path, "rb") as src, \
+                aiofile.async_open(dest_file_path, "wb") as dest:
+            async for chunk in src.iter_chunked(chunk_size):
+                await dest.write(chunk)
+        self.concurrent_operations_sem.release()
 
 
 async def _dummy_coroutine(result):
@@ -49,7 +56,11 @@ async def _dummy_coroutine(result):
 
 
 class SessionAgent:
-    def __init__(self, auth: Optional[aiohttp.BasicAuth] = None, max_nr_concurrent_requests: int = 5, max_nr_attempts: int = 5):
+    def __init__(
+            self,
+            auth: Optional[aiohttp.BasicAuth] = None,
+            max_nr_concurrent_requests: int = 5,
+            max_nr_attempts: int = 5):
         self.auth = auth
         self.is_under_limit = False
         self.under_limit_wake_up_events = []
@@ -64,6 +75,7 @@ class SessionAgent:
     async def get_session(self) -> aiohttp.ClientSession:
         while self.session is None:
             await self.create_session()
+        assert self.session is not None
         return self.session
 
     async def close_session_if_opened(self):
@@ -136,7 +148,8 @@ class RawJavaDatasetGitHubScrapper:
             token: Optional[str] = None,
             max_nr_concurrent_api_requests: int = 5,
             max_concurrent_downloads: int = 5,
-            max_nr_attempts: int = 5):
+            max_nr_attempts: int = 5,
+            max_nr_concurrent_fs_ios: int = 10):
         self.api_session_agent = SessionAgent(
             auth=aiohttp.BasicAuth(user, token) if user and token else None,
             max_nr_concurrent_requests=max_nr_concurrent_api_requests,
@@ -144,6 +157,8 @@ class RawJavaDatasetGitHubScrapper:
         self.downloads_session_agent = SessionAgent(
             max_nr_concurrent_requests=max_concurrent_downloads,
             max_nr_attempts=max_nr_attempts)
+        self.ioFileHelper = IOFileHelper(max_nr_concurrent_operations=max_nr_concurrent_fs_ios)
+        self.concurrent_fs_io_processes_sem = asyncio.BoundedSemaphore(max_nr_concurrent_fs_ios)
 
     def is_repo_considered_popular(self, repo_info: GithubRepositoryInfo) -> bool:
         repo_info_min_requirement = GithubRepositoryInfo(
@@ -480,6 +495,8 @@ class RawJavaDatasetGitHubScrapper:
         if branch_name is None:
             branch_name = await self.get_repository_default_branch(
                 owner_name=owner_name, repository_name=repository_name)
+        # We avoid making too many concurrent IOs to FS.
+        await self.concurrent_fs_io_processes_sem.acquire()
         async with atempfile.TemporaryDirectory() as tmp_dir:
             await self.clone_repository(
                 owner_name=owner_name, repository_name=repository_name,
@@ -489,6 +506,7 @@ class RawJavaDatasetGitHubScrapper:
             await repo_output_dir_path.mkdir(parents=True, exist_ok=True)
             await self.recursively_find_and_copy_all_java_files(
                 look_in_dir_path=tmp_dir, tgt_dir_path=repo_output_dir)
+        self.concurrent_fs_io_processes_sem.release()
 
     async def clone_repository(
             self, owner_name: str, repository_name: str, branch_name: str,
@@ -523,7 +541,7 @@ class RawJavaDatasetGitHubScrapper:
             if filename_occurrences[filename] > 1:
                 filename = f"{filename.rstrip('.java')}__{filename_occurrences[filename]}.java"
                 assert filename not in filename_occurrences
-            tasks.append(asyncio.create_task(_async_copy_file(
+            tasks.append(asyncio.create_task(self.ioFileHelper.async_copy_file(
                 source_file_path=java_file_path,
                 dest_file_path=os.path.join(tgt_dir_path, filename))))
         await asyncio.gather(*tasks)
