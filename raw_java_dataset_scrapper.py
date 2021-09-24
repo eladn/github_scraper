@@ -43,18 +43,99 @@ async def _async_copy_file(source_file_path: str, dest_file_path: str, chunk_siz
             await dest.write(chunk)
 
 
+class SessionAgent:
+    def __init__(self, auth: Optional[aiohttp.BasicAuth] = None, max_nr_concurrent_requests: int = 5, max_nr_attempts: int = 5):
+        self.auth = auth
+        self.is_under_limit = False
+        self.under_limit_wake_up_events = []
+        self.concurrent_api_requests_sem = asyncio.BoundedSemaphore(max_nr_concurrent_requests)
+        self.max_nr_attempts = max_nr_attempts
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def create_session(self):
+        await self.close_session_if_opened()
+        self.session = aiohttp.ClientSession(auth=self.auth)
+
+    async def get_session(self) -> aiohttp.ClientSession:
+        while self.session is None:
+            await self.create_session()
+        return self.session
+
+    async def close_session_if_opened(self):
+        session = self.session
+        if session is not None:
+            self.session = None
+            await session.close()
+
+    async def _before_fence(self):
+        await self.concurrent_api_requests_sem.acquire()
+        if not self.is_under_limit:
+            return
+        wake_up_events = asyncio.Event()
+        self.under_limit_wake_up_events.append(wake_up_events)
+        await wake_up_events.wait()
+
+    async def _after_release(self, response_status: int):
+        if response_status != 403:
+            self.concurrent_api_requests_sem.release()
+            return True
+        if not self.is_under_limit:
+            self.under_limit_wake_up_events = []
+            self.is_under_limit = True
+            print('Limit reached. Stopping all upcoming requests for some time..')
+            await asyncio.sleep(60 * 2)
+            print('Woke up.')
+            self.is_under_limit = False
+            under_limit_wake_up_events = self.under_limit_wake_up_events
+            self.under_limit_wake_up_events = []
+            for under_limit_wake_up_event in under_limit_wake_up_events:
+                under_limit_wake_up_event.set()
+        self.concurrent_api_requests_sem.release()
+        return False
+
+    async def request(self, url, method='get', json: bool = False, body=None, headers=None):
+        for attempt_nr in range(self.max_nr_attempts):
+            if attempt_nr > 0:
+                await asyncio.sleep(5 * attempt_nr)
+            while True:
+                await self._before_fence()
+                session = await self.get_session()
+                request_additional_kwargs = {}
+                if body is not None:
+                    request_additional_kwargs['body'] = body
+                if headers is not None:
+                    request_additional_kwargs['headers'] = headers
+                async with session.request(method=method, url=url, **request_additional_kwargs) as response:
+                    is_limit_ok = await self._after_release(response.status)
+                    if not is_limit_ok:
+                        continue  # inner loop - don't count as a failed attempt
+                    if response.status != 200:
+                        break  # like "continue" for outer loop - counts as a failed attempt
+                    if json:
+                        try:
+                            json = await response.json()
+                            return response, json
+                        except:
+                            break  # like "continue" for outer loop - counts as a failed attempt
+                    else:
+                        return response
+        return None
+
+
 class RawJavaDatasetGitHubScrapper:
     def __init__(
             self, user: Optional[str] = None,
             token: Optional[str] = None,
-            max_nr_concurrent_api_requests: int = 5):
-        self.api_auth = aiohttp.BasicAuth(user, token) if user and token else None
-        self.is_under_limit = False
-        self.under_limit_wake_up_events = []
-        self.concurrent_api_requests_sem = asyncio.BoundedSemaphore(max_nr_concurrent_api_requests)
-        self.session: Dict[str, aiohttp.ClientSession] = {}
-
-    NR_ATTEMPTS: int = 5
+            max_nr_concurrent_api_requests: int = 5,
+            max_concurrent_downloads: int = 5,
+            max_nr_attempts: int = 5):
+        self.api_session_agent = SessionAgent(
+            auth=aiohttp.BasicAuth(user, token) if user and token else None,
+            max_nr_concurrent_requests=max_nr_concurrent_api_requests,
+            max_nr_attempts=max_nr_attempts)
+        self.downloads_session_agent = SessionAgent(
+            max_nr_concurrent_requests=max_concurrent_downloads,
+            max_nr_attempts=max_nr_attempts)
 
     def is_repo_considered_popular(self, repo_info: GithubRepositoryInfo) -> bool:
         repo_info_min_requirement = GithubRepositoryInfo(
@@ -223,95 +304,23 @@ class RawJavaDatasetGitHubScrapper:
         assert len(wanted_page_res) == 1
         return wanted_page_res[0]
 
-    async def _api_call_limit_check(self, status: int) -> bool:
-        if status != 403:
-            self.concurrent_api_requests_sem.release()
-            return True
-        if not self.is_under_limit:
-            self.under_limit_wake_up_events = []
-            self.is_under_limit = True
-            print('Limit reached. Stopping all upcoming requests for some time..')
-            await asyncio.sleep(60 * 2)
-            print('Woke up.')
-            self.is_under_limit = False
-            under_limit_wake_up_events = self.under_limit_wake_up_events
-            self.under_limit_wake_up_events = []
-            for under_limit_wake_up_event in under_limit_wake_up_events:
-                under_limit_wake_up_event.set()
-        self.concurrent_api_requests_sem.release()
-        return False
-
-    async def _api_call_limit_fence(self):
-        await self.concurrent_api_requests_sem.acquire()
-        if not self.is_under_limit:
-            return
-        wake_up_events = asyncio.Event()
-        self.under_limit_wake_up_events.append(wake_up_events)
-        await wake_up_events.wait()
-
-    async def create_session(self, session_name: str, auth: Optional[aiohttp.BasicAuth] = None):
-        await self.close_session_if_opened(session_name=session_name)
-        self.session[session_name] = aiohttp.ClientSession(auth=auth)
-
-    async def get_session(self, session_name: str, auth: Optional[aiohttp.BasicAuth] = None) -> aiohttp.ClientSession:
-        while session_name not in self.session:
-            await self.create_session(session_name=session_name, auth=auth)
-        return self.session[session_name]
-
-    async def close_session_if_opened(self, session_name: str):
-        if session_name not in self.session:
-            return
-        old_session = self.session.pop(session_name)
-        await old_session.close()
-
-    async def close_opened_sessions(self):
-        opened_sessions = tuple(self.session.keys())
-        for session_name in opened_sessions:
-            await self.close_session_if_opened(session_name=session_name)
-
-    async def get_api_session(self) -> aiohttp.ClientSession:
-        return await self.get_session(session_name='api', auth=self.api_auth)
-
-    async def get_general_session(self) -> aiohttp.ClientSession:
-        return await self.get_session(session_name='general')
-
     async def _json_api_call(self, api_req_url: str) -> Optional[Union[list, dict]]:
-        for attempt_nr in range(self.NR_ATTEMPTS):
-            if attempt_nr > 0:
-                await asyncio.sleep(5 * attempt_nr)
-            while True:
-                await self._api_call_limit_fence()
-                session = await self.get_api_session()
-                async with session.get(api_req_url) as response:
-                    limit_ok = await self._api_call_limit_check(response.status)
-                    if not limit_ok:
-                        continue  # inner loop - don't count as a failed attempt
-                    if response.status != 200:
-                        break  # like "continue" for outer loop - counts as a failed attempt
-                    try:
-                        json = await response.json()
-                        print('successful json api request')
-                        return json
-                    except:
-                        break  # like "continue" for outer loop - counts as a failed attempt
-        return None
+        ret = await self.api_session_agent.request(api_req_url, json=True)
+        if ret is None:
+            # TODO: what do we do in this case?
+            return None
+        print('successful json api request')
+        resp, json = ret
+        return json
 
     async def _api_call(self, api_req_url: str) -> Optional[aiohttp.ClientResponse]:
-        for attempt_nr in range(self.NR_ATTEMPTS):
-            if attempt_nr > 0:
-                await asyncio.sleep(5 * attempt_nr)
-            while True:
-                await self._api_call_limit_fence()
-                session = await self.get_api_session()
-                async with session.get(api_req_url) as response:
-                    limit_ok = await self._api_call_limit_check(response.status)
-                    if not limit_ok:
-                        continue  # inner loop - don't count as a failed attempt
-                    if response.status != 200:
-                        break  # like "continue" for outer loop - counts as a failed attempt
-                    print('successful api request')
-                    return response
-        return None
+        response = await self.api_session_agent.request(api_req_url)
+        if response is None:
+            # TODO: what do we do in this case?
+            pass
+        if response is not None:
+            print('successful api request')
+        return response
 
     async def _get_repository_nr_commits_old(self, owner_name: str, repository_name: str) -> int:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
@@ -467,34 +476,25 @@ class RawJavaDatasetGitHubScrapper:
             self, owner_name: str, repository_name: str, branch_name: str,
             target_dir_path: str, chunk_size: int = 65535):
         repo_zip_file_url = f'https://github.com/{owner_name}/{repository_name}/archive/{branch_name}.zip'
-        for attempt_nr in range(self.NR_ATTEMPTS):
-            if attempt_nr > 0:
-                await asyncio.sleep(5 * attempt_nr)
+        response = await self.downloads_session_agent.request(repo_zip_file_url)
+        if response is None:
+            pass
+        print('successful file download')
+        zip_file_path = os.path.join(target_dir_path, f'{repository_name}.zip')
+        async with aiofiles.open(zip_file_path, mode='wb') as zip_file:
             while True:
-                await self._api_call_limit_fence()
-                session = await self.get_general_session()
-                async with session.get(repo_zip_file_url) as response:
-                    limit_ok = await self._api_call_limit_check(response.status)
-                    if not limit_ok:
-                        continue  # inner loop - don't count as a failed attempt
-                    if response.status != 200:
-                        break  # like "continue" for outer loop - counts as a failed attempt
-                    print('successful file download')
-                    zip_file_path = os.path.join(target_dir_path, f'{repository_name}.zip')
-                    async with aiofiles.open(zip_file_path, mode='wb') as zip_file:
-                        while True:
-                            chunk = await response.content.read(chunk_size)
-                            if not chunk:
-                                break
-                            await zip_file.write(chunk)
-                    unzip_proc = await asyncio.create_subprocess_exec(
-                        'unzip', '-o', zip_file_path, '-d', target_dir_path,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL)
-                    await unzip_proc.communicate()
-                    exit_code = await unzip_proc.wait()
-                    assert exit_code == 0
-                    return
+                chunk = await response.content.read(chunk_size)
+                if not chunk:
+                    break
+                await zip_file.write(chunk)
+        unzip_proc = await asyncio.create_subprocess_exec(
+            'unzip', '-o', zip_file_path, '-d', target_dir_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL)
+        await unzip_proc.communicate()
+        exit_code = await unzip_proc.wait()
+        assert exit_code == 0
+        return
 
     async def recursively_find_and_copy_all_java_files(self, look_in_dir_path: str, tgt_dir_path: str):
         filename_occurrences: Dict[str, int] = defaultdict(int)
@@ -510,6 +510,11 @@ class RawJavaDatasetGitHubScrapper:
                 dest_file_path=os.path.join(tgt_dir_path, filename))))
         await asyncio.gather(*tasks)
 
+    async def close(self):
+        await asyncio.gather((
+            asyncio.create_task(self.api_session_agent.close_session_if_opened()),
+            asyncio.create_task(self.downloads_session_agent.close_session_if_opened())))
+
 
 async def async_main():
     parser = create_argparser()
@@ -520,7 +525,7 @@ async def async_main():
             owner_names=args.owner_names, output_dir_path=args.output_dir_path,
             popularity_check=not args.no_popularity_check)
     finally:
-        await scrapper.close_opened_sessions()
+        await scrapper.close()
 
 
 def sync_main():
