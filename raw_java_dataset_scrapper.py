@@ -44,9 +44,10 @@ async def _async_copy_file(source_file_path: str, dest_file_path: str, chunk_siz
 
 
 class RawJavaDatasetGitHubScrapper:
-    def __init__(self):
+    def __init__(self, max_nr_concurrent_api_requests: int = 5):
         self.is_under_limit = False
         self.under_limit_wake_up_events = []
+        self.concurrent_api_requests_sem = asyncio.BoundedSemaphore(max_nr_concurrent_api_requests)
 
     NR_ATTEMPTS: int = 5
 
@@ -207,6 +208,7 @@ class RawJavaDatasetGitHubScrapper:
 
     async def _api_call_limit_check(self, status: int) -> bool:
         if status != 403:
+            self.concurrent_api_requests_sem.release()
             return True
         if not self.is_under_limit:
             self.under_limit_wake_up_events = []
@@ -219,9 +221,11 @@ class RawJavaDatasetGitHubScrapper:
             self.under_limit_wake_up_events = []
             for under_limit_wake_up_event in under_limit_wake_up_events:
                 under_limit_wake_up_event.set()
+        self.concurrent_api_requests_sem.release()
         return False
 
     async def _api_call_limit_fence(self):
+        await self.concurrent_api_requests_sem.acquire()
         if not self.is_under_limit:
             return
         wake_up_events = asyncio.Event()
@@ -243,7 +247,7 @@ class RawJavaDatasetGitHubScrapper:
                             break  # like "continue" for outer loop - counts as a failed attempt
                         try:
                             json = await response.json()
-                            # print('successful json api request')
+                            print('successful json api request')
                             return json
                         except:
                             break  # like "continue" for outer loop - counts as a failed attempt
@@ -262,7 +266,7 @@ class RawJavaDatasetGitHubScrapper:
                             continue  # inner loop - don't count as a failed attempt
                         if response.status != 200:
                             break  # like "continue" for outer loop - counts as a failed attempt
-                        # print('successful api request')
+                        print('successful api request')
                         return response
         return None
 
@@ -295,6 +299,13 @@ class RawJavaDatasetGitHubScrapper:
     async def get_repository_nr_tags(self, owner_name: str, repository_name: str) -> int:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
         return await self._get_nr_pages_for_paginated_api_call(f'{api_info_req_url}/tags')
+
+    async def get_repository_default_branch(self, owner_name: str, repository_name: str) -> Optional[str]:
+        api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
+        repo_info_dict = await self._json_api_call(api_info_req_url)
+        if repo_info_dict is None:
+            return None
+        return repo_info_dict['default_branch']
 
     async def get_repository_info(self, owner_name: str, repository_name: str) -> Optional[GithubRepositoryInfo]:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
@@ -351,18 +362,28 @@ class RawJavaDatasetGitHubScrapper:
             default_branch=repo_info_dict['default_branch']
         )
 
-    async def scrape_and_prepare_owners(self, owner_names: List[str], output_dir_path: str):
+    async def scrape_and_prepare_owners(
+            self, owner_names: List[str], output_dir_path: str, popularity_check: bool = True):
         await asyncio.gather(*(
-            self.scrape_and_prepare_owner(owner_name=owner_name, output_dir_path=output_dir_path)
+            self.scrape_and_prepare_owner(
+                owner_name=owner_name, output_dir_path=output_dir_path, popularity_check=popularity_check)
             for owner_name in owner_names
         ))
 
-    async def scrape_and_prepare_owner(self, owner_name: str, output_dir_path: str):
-        tasks = [
-            asyncio.create_task(self.scrape_and_prepare_repository_if_popular(
-                owner_name=owner_name, repository_name=repository_name, output_dir_path=output_dir_path))
-            async for repository_name in self.find_all_java_repositories_names_of_owner(owner_name=owner_name)
-        ]
+    async def scrape_and_prepare_owner(
+            self, owner_name: str, output_dir_path: str, popularity_check: bool = True):
+        if popularity_check:
+            tasks = [
+                asyncio.create_task(self.scrape_and_prepare_repository_if_popular(
+                    owner_name=owner_name, repository_name=repository_name, output_dir_path=output_dir_path))
+                async for repository_name in self.find_all_java_repositories_names_of_owner(owner_name=owner_name)
+            ]
+        else:
+            tasks = [
+                asyncio.create_task(self.scrape_and_prepare_repository(
+                    owner_name=owner_name, repository_name=repository_name, output_dir_path=output_dir_path))
+                async for repository_name in self.find_all_java_repositories_names_of_owner(owner_name=owner_name)
+            ]
         await asyncio.gather(*tasks)
 
     async def scrape_and_prepare_repository_if_popular(
@@ -374,7 +395,10 @@ class RawJavaDatasetGitHubScrapper:
                 branch_name=repo_info.default_branch, output_dir_path=output_dir_path)
 
     async def scrape_and_prepare_repository(
-            self, owner_name: str, repository_name: str, branch_name: str, output_dir_path: str):
+            self, owner_name: str, repository_name: str, output_dir_path: str, branch_name: Optional[str] = None):
+        if branch_name is None:
+            branch_name = await self.get_repository_default_branch(
+                owner_name=owner_name, repository_name=repository_name)
         async with atempfile.TemporaryDirectory() as tmp_dir:
             await self.clone_repository(
                 owner_name=owner_name, repository_name=repository_name,
@@ -400,7 +424,7 @@ class RawJavaDatasetGitHubScrapper:
                             continue  # inner loop - don't count as a failed attempt
                         if response.status != 200:
                             break  # like "continue" for outer loop - counts as a failed attempt
-                        # print('successful file download')
+                        print('successful file download')
                         zip_file_path = os.path.join(target_dir_path, f'{repository_name}.zip')
                         zip_file = await aiofiles.open(zip_file_path, mode='wb')
                         await zip_file.write(await response.read())
@@ -429,22 +453,28 @@ class RawJavaDatasetGitHubScrapper:
         await asyncio.gather(*tasks)
 
 
-def main():
+async def async_main():
     parser = create_argparser()
     args = parser.parse_args()
     scrapper = RawJavaDatasetGitHubScrapper()
+    await scrapper.scrape_and_prepare_owners(
+        owner_names=args.owner_names, output_dir_path=args.output_dir_path,
+        popularity_check=not args.no_popularity_check)
+
+
+def sync_main():
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(scrapper.scrape_and_prepare_owners(
-        owner_names=args.owner_names, output_dir_path=args.output_dir_path))
+    asyncio.run(async_main())
 
 
 def create_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument('--owners', type=str, required=True, nargs='+', dest='owner_names')
+    parser.add_argument('--no-popularity-check', action='store_true', dest='no_popularity_check')
     parser.add_argument('--output-dir', type=str, required=True, dest='output_dir_path')
     return parser
 
 
 if __name__ == '__main__':
-    main()
+    sync_main()
