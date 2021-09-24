@@ -33,7 +33,7 @@ class GithubRepositoryInfo:
     subscribers_count: Optional[int]
     java_language_freq: Optional[float]
     last_commits_avg_time_delta: Optional[datetime.timedelta]
-    default_branch: str
+    default_branch: Optional[str]
 
 
 async def _async_copy_file(source_file_path: str, dest_file_path: str, chunk_size: int = 65535):
@@ -139,24 +139,44 @@ class RawJavaDatasetGitHubScrapper:
 
     def is_repo_considered_popular(self, repo_info: GithubRepositoryInfo) -> bool:
         repo_info_min_requirement = GithubRepositoryInfo(
-            nr_contributors=50,
-            nr_stars=100,
-            nr_commits=1500,
-            nr_tags=10,
-            nr_forks=30,
-            nr_branches=10,
-            nr_watchers=30,
-            network_count=20,
-            subscribers_count=30,
+            nr_contributors=None,
+            nr_stars=40,
+            nr_commits=3000,
+            nr_tags=None,
+            nr_forks=None,
+            nr_branches=None,
+            nr_watchers=None,
+            network_count=None,
+            subscribers_count=None,
             java_language_freq=0.7,
             last_commits_avg_time_delta=datetime.timedelta(days=-60),
-            default_branch=''
+            default_branch=None
         )
-        is_repo_popular = all(
+        repo_info_popularity_requirement = GithubRepositoryInfo(
+            nr_contributors=50,
+            nr_stars=100,
+            nr_commits=5000,
+            nr_tags=30,
+            nr_forks=100,
+            nr_branches=30,
+            nr_watchers=100,
+            network_count=20,
+            subscribers_count=100,
+            java_language_freq=None,
+            last_commits_avg_time_delta=datetime.timedelta(days=-5),
+            default_branch=None
+        )
+        is_repo_valid = all(
             getattr(repo_info, field.name) >= getattr(repo_info_min_requirement, field.name)
             for field in dataclasses.fields(repo_info_min_requirement)
             if getattr(repo_info, field.name) is not None and
             isinstance(getattr(repo_info_min_requirement, field.name), (int, float, datetime.timedelta)))
+        is_repo_exceptional = any(
+            getattr(repo_info, field.name) >= getattr(repo_info_popularity_requirement, field.name)
+            for field in dataclasses.fields(repo_info_popularity_requirement)
+            if getattr(repo_info, field.name) is not None and
+            isinstance(getattr(repo_info_popularity_requirement, field.name), (int, float, datetime.timedelta)))
+        is_repo_popular = is_repo_valid and is_repo_exceptional
         # print('is_repo_popular', is_repo_popular)
         return is_repo_popular
 
