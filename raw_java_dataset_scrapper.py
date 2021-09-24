@@ -43,12 +43,11 @@ class IOFileHelper:
 
     async def async_copy_file(self, source_file_path: str, dest_file_path: str, chunk_size: int = 65535):
         # We avoid making too many concurrent IOs to FS.
-        await self.concurrent_operations_sem.acquire()
-        async with aiofile.async_open(source_file_path, "rb") as src, \
-                aiofile.async_open(dest_file_path, "wb") as dest:
-            async for chunk in src.iter_chunked(chunk_size):
-                await dest.write(chunk)
-        self.concurrent_operations_sem.release()
+        async with self.concurrent_operations_sem:
+            async with aiofile.async_open(source_file_path, "rb") as src, \
+                    aiofile.async_open(dest_file_path, "wb") as dest:
+                async for chunk in src.iter_chunked(chunk_size):
+                    await dest.write(chunk)
 
 
 async def _dummy_coroutine(result):
@@ -112,17 +111,20 @@ class SessionAgent:
 
     @asynccontextmanager
     async def request(self, url, method='get', json: bool = False, body=None, headers=None):
+        request_additional_kwargs = {}
+        if body is not None:
+            request_additional_kwargs['body'] = body
+        if headers is not None:
+            request_additional_kwargs['headers'] = headers
+
         for attempt_nr in range(self.max_nr_attempts):
             if attempt_nr > 0:
                 await asyncio.sleep(5 * attempt_nr)
             while True:
+                # TODO: use context-manager for the semaphore here!
+                #  currently it could get locked but never released here.
                 await self._before_fence()
                 session = await self.get_session()
-                request_additional_kwargs = {}
-                if body is not None:
-                    request_additional_kwargs['body'] = body
-                if headers is not None:
-                    request_additional_kwargs['headers'] = headers
                 async with session.request(method=method, url=url, **request_additional_kwargs) as response:
                     is_limit_ok = await self._after_release(response.status)
                     if not is_limit_ok:
@@ -150,6 +152,7 @@ class RawJavaDatasetGitHubScrapper:
             max_concurrent_downloads: int = 5,
             max_nr_attempts: int = 5,
             max_nr_concurrent_fs_ios: int = 10):
+        self.max_nr_attempts = max_nr_attempts
         self.api_session_agent = SessionAgent(
             auth=aiohttp.BasicAuth(user, token) if user and token else None,
             max_nr_concurrent_requests=max_nr_concurrent_api_requests,
@@ -495,18 +498,32 @@ class RawJavaDatasetGitHubScrapper:
         if branch_name is None:
             branch_name = await self.get_repository_default_branch(
                 owner_name=owner_name, repository_name=repository_name)
-        # We avoid making too many concurrent IOs to FS.
-        await self.concurrent_fs_io_processes_sem.acquire()
-        async with atempfile.TemporaryDirectory() as tmp_dir:
-            await self.clone_repository(
-                owner_name=owner_name, repository_name=repository_name,
-                branch_name=branch_name, target_dir_path=tmp_dir)
-            repo_output_dir = os.path.join(output_dir_path, repository_name)
-            repo_output_dir_path = aiopath.path.AsyncPath(repo_output_dir)
-            await repo_output_dir_path.mkdir(parents=True, exist_ok=True)
-            await self.recursively_find_and_copy_all_java_files(
-                look_in_dir_path=tmp_dir, tgt_dir_path=repo_output_dir)
-        self.concurrent_fs_io_processes_sem.release()
+        repository_long_name = f'{owner_name}/{repository_name}:{branch_name}'
+        for attempt_nr in range(1, self.max_nr_attempts + 1):
+            if attempt_nr > 1:
+                await asyncio.sleep(5 * (attempt_nr - 1))
+            try:
+                # We avoid making too many concurrent IOs to FS.
+                async with self.concurrent_fs_io_processes_sem:
+                    async with atempfile.TemporaryDirectory() as tmp_dir:
+                        await self.clone_repository(
+                            owner_name=owner_name, repository_name=repository_name,
+                            branch_name=branch_name, target_dir_path=tmp_dir)
+                        repo_output_dir = os.path.join(output_dir_path, repository_name)
+                        repo_output_dir_path = aiopath.path.AsyncPath(repo_output_dir)
+                        await repo_output_dir_path.mkdir(parents=True, exist_ok=True)
+                        await self.recursively_find_and_copy_all_java_files(
+                            look_in_dir_path=tmp_dir, tgt_dir_path=repo_output_dir)
+                    break  # the operation succeeded - no further attempt needed
+            except OSError as error:
+                if attempt_nr == self.max_nr_attempts:
+                    raise RuntimeError(f'Could not clone & prepare repository `{repository_long_name}` '
+                                       f'due to an OS error [{error.errno}] (after {attempt_nr} attempts). '
+                                       f'Error: {error}')
+                else:
+                    warn(f'OS Error [{error.errno}] occurred while trying to clone & prepare '
+                         f'repository `{repository_long_name}` (after {attempt_nr}/{self.max_nr_attempts} attempts). '
+                         f'Error: {error}')
 
     async def clone_repository(
             self, owner_name: str, repository_name: str, branch_name: str,
