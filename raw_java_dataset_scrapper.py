@@ -662,6 +662,7 @@ class RawJavaDatasetGitHubScrapper:
             branch_name = await self.get_repository_default_branch(
                 owner_name=owner_name, repository_name=repository_name)
         repository_long_name = f'{owner_name}/{repository_name}:{branch_name}'
+        print(f'Cloning & preparing repo `{repository_long_name}` ..')
         for attempt_nr in range(1, self.max_nr_attempts + 1):
             if attempt_nr > 1:
                 await asyncio.sleep(5 * (attempt_nr - 1))
@@ -697,6 +698,8 @@ class RawJavaDatasetGitHubScrapper:
                          f'repository `{repository_long_name}` (after {attempt_nr}/{self.max_nr_attempts} attempts). '
                          f'Error: {error}')
 
+        print(f'Done cloning & preparing repo `{repository_long_name}`.')
+
     async def clone_repository(
             self, owner_name: str, repository_name: str, branch_name: str,
             target_dir_path: str, chunk_size: int = 65535):
@@ -711,7 +714,7 @@ class RawJavaDatasetGitHubScrapper:
                     if not chunk:
                         break
                     await zip_file.write(chunk)
-            print('successful file download')
+            # print('successful file download')
         unzip_proc = await asyncio.create_subprocess_exec(
             'unzip', '-o', zip_file_path, '-d', target_dir_path,
             stdout=asyncio.subprocess.DEVNULL,
