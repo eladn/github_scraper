@@ -329,14 +329,11 @@ class RawJavaDatasetGitHubScrapper:
                 isinstance(getattr(conditions, field.name), (int, float, datetime.timedelta)))
 
         def mean(data):
-            n, mean_accumulator = 0, 0.0
+            nr_items, mean_accumulator = 0, 0.0
             for x in data:
-                n += 1
-                mean_accumulator += (x - mean_accumulator) / n
-            if n < 1:
-                return float('nan')
-            else:
-                return mean_accumulator
+                nr_items += 1
+                mean_accumulator += (x - mean_accumulator) / nr_items
+            return float('nan') if nr_items < 1 else mean_accumulator
 
         relaxed_conjunction = mean(check_conditions(repo_info_relaxed_conditions)) > 0.75 - 2 * sys.float_info.epsilon
         moderate_majority = mean(check_conditions(repo_info_moderate_conditions)) > 0.5 - 2 * sys.float_info.epsilon
