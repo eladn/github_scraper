@@ -32,7 +32,7 @@ class GithubRepositoryInfo:
     nr_watchers: Optional[int] = None
     network_count: Optional[int] = None
     subscribers_count: Optional[int] = None
-    java_language_freq: Optional[float] = None
+    main_language_freq: Optional[float] = None
     last_commits_avg_time_delta: Optional[datetime.timedelta] = None
     default_branch: Optional[str] = None
 
@@ -263,7 +263,7 @@ class SessionAgent:
         return
 
 
-class RawJavaDatasetGitHubScrapper:
+class GitHubScrapper:
     def __init__(
             self, user: Optional[str] = None,
             token: Optional[str] = None,
@@ -343,19 +343,17 @@ class RawJavaDatasetGitHubScrapper:
         # print('is_repo_popular', is_repo_popular, relaxed_conjunction, strict_disjunction, moderate_majority)
         return is_repo_popular
 
-    async def find_all_java_repositories_of_owner(self, owner_name: str) -> AsyncIterable[dict]:
+    async def find_all_repositories_of_owner(self, owner_name: str) -> AsyncIterable[dict]:
         api_repos_req_url = f'https://api.github.com/orgs/{owner_name}/repos'
         async for repo_dict in self._paginated_iterator_api_call(api_repos_req_url):
-            assert 'name' in repo_dict and 'language' in repo_dict
-            if repo_dict['language'] and repo_dict['language'].lower() == 'java':
-                yield repo_dict
+            assert 'name' in repo_dict
+            yield repo_dict
 
-    async def find_all_java_repositories_names_of_owner(self, owner_name: str) -> AsyncIterable[str]:
+    async def find_all_repositories_names_of_owner(self, owner_name: str) -> AsyncIterable[str]:
         api_repos_req_url = f'https://api.github.com/orgs/{owner_name}/repos'
         async for repo_dict in self._paginated_iterator_api_call(api_repos_req_url):
-            assert 'name' in repo_dict and 'language' in repo_dict
-            if repo_dict['language'] and repo_dict['language'].lower() == 'java':
-                yield repo_dict['name']
+            assert 'name' in repo_dict
+            yield repo_dict['name']
 
     def _get_url_for_page(self, api_req_url: str, page_size: int, page_nr: int) -> str:
         api_req_url_parsed = urlparse(api_req_url)
@@ -547,7 +545,8 @@ class RawJavaDatasetGitHubScrapper:
             repo_dict: Optional[dict] = None) -> Optional[GithubRepositoryInfo]:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
         requests_coroutines = {
-            'repo_languages_dict': self._json_api_call(f'{api_info_req_url}/languages', raise_on_failure=True),
+            # 'repo_main_language_freq': self.get_repo_main_language_freq(
+            #     owner_name=owner_name, repository_name=repository_name, raise_on_failure=True),
             'repo_nr_contributors': self.get_repository_nr_contributors(
                 owner_name=owner_name, repository_name=repository_name),
             'repo_nr_tags': self.get_repository_nr_tags(
@@ -566,7 +565,7 @@ class RawJavaDatasetGitHubScrapper:
         await asyncio.gather(*requests_tasks.values())
         responses = {name: task.result() for name, task in requests_tasks.items()}
         repo_info_dict = responses['repo_info_dict'] if 'repo_info_dict' in responses else repo_dict
-        repo_languages_dict = responses['repo_languages_dict']
+        # repo_main_language_freq = responses['repo_main_language_freq']
         repo_nr_contributors = responses['repo_nr_contributors']
         repo_nr_tags = responses['repo_nr_tags']
         repo_last_commits = responses['repo_last_commits']
@@ -581,10 +580,6 @@ class RawJavaDatasetGitHubScrapper:
         last_commits_avg_time_delta = last_commits_dates_avg_datetime - datetime.datetime.today()
         if repo_info_dict is None:
             return None
-        if repo_languages_dict is None:
-            return None
-        java_language_freq = \
-            (repo_languages_dict['Java'] / sum(repo_languages_dict.values())) if 'Java' in repo_languages_dict else 0
         return GithubRepositoryInfo(
             nr_contributors=repo_nr_contributors,
             nr_stars=repo_info_dict['stargazers_count'],
@@ -597,17 +592,41 @@ class RawJavaDatasetGitHubScrapper:
             nr_watchers=repo_info_dict['watchers_count'],
             network_count=None,  #repo_info_dict['network_count'],
             subscribers_count=None,  #repo_info_dict['subscribers_count'],
-            java_language_freq=java_language_freq,
+            # main_language_freq=repo_main_language_freq,
             last_commits_avg_time_delta=last_commits_avg_time_delta,
             default_branch=repo_info_dict['default_branch']
         )
 
+    async def get_repo_main_language_freq(
+            self, owner_name: str, repository_name: str, raise_on_failure: bool = True) -> Optional[float]:
+        api_repo_languages_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}/languages'
+        repo_languages_dict = await self._json_api_call(api_repo_languages_req_url, raise_on_failure=raise_on_failure)
+        if repo_languages_dict is None:
+            assert not raise_on_failure
+            return None
+        main_language = max(repo_languages_dict.keys(), default=None, key=repo_languages_dict.get)
+        main_language_freq = \
+            (repo_languages_dict[main_language] / sum(repo_languages_dict.values())) \
+                if main_language in repo_languages_dict else 0.0
+        return main_language_freq
+
     async def scrape_and_prepare_owners(
-            self, owner_names: List[str], output_dir_path: str, popularity_check: bool = True):
+            self,
+            owner_names: List[str],
+            output_dir_path: str,
+            popularity_check: bool = True,
+            main_language: Optional[str] = None,
+            min_main_language_freq: Optional[float] = None,
+            file_extensions: Optional[List[str]] = None):
         tasks = []
         for owner_name in owner_names:
             tasks.append(asyncio.create_task(self.scrape_and_prepare_owner(
-                owner_name=owner_name, output_dir_path=output_dir_path, popularity_check=popularity_check)))
+                owner_name=owner_name,
+                output_dir_path=output_dir_path,
+                popularity_check=popularity_check,
+                main_language=main_language,
+                min_main_language_freq=min_main_language_freq,
+                file_extensions=file_extensions)))
             # Yield to avoid starving of sub-tasks. Prefer depth-first work-order scheduling over breadth-first.
             # Namely, allow download of the 1st project before finishing scraping data on all projects.
             await asyncio.sleep(1)
@@ -629,41 +648,57 @@ class RawJavaDatasetGitHubScrapper:
             self, owner_name: str,
             output_dir_path: str,
             popularity_check: bool = True,
-            repository_names: Optional[List[str]] = None):
+            repository_names: Optional[List[str]] = None,
+            main_language: Optional[str] = None,
+            min_main_language_freq: Optional[float] = None,
+            file_extensions: Optional[List[str]] = None):
         tasks = []
 
         repositories_iterator = \
-            self.find_all_java_repositories_of_owner(owner_name=owner_name) \
+            self.find_all_repositories_of_owner(owner_name=owner_name) \
                 if repository_names is None else \
                 self.iterate_repositories_data(owner_name=owner_name, repository_names=repository_names)
 
         async for repository_dict in repositories_iterator:
-            if popularity_check:
-                tasks.append(asyncio.create_task(self.scrape_and_prepare_repository_if_popular(
-                    owner_name=owner_name, repository_name=repository_dict['name'],
-                    output_dir_path=output_dir_path, repository_dict=repository_dict)))
-            else:
-                tasks.append(asyncio.create_task(self.scrape_and_prepare_repository(
-                    owner_name=owner_name, repository_name=repository_dict['name'],
-                    output_dir_path=output_dir_path, branch_name=repository_dict['default_branch'])))
+            tasks.append(asyncio.create_task(self.scrape_and_prepare_repository_conditionally(
+                owner_name=owner_name, repository_name=repository_dict['name'],
+                output_dir_path=output_dir_path, repository_dict=repository_dict,
+                file_extensions=file_extensions, main_language=main_language,
+                min_main_language_freq=min_main_language_freq, popularity_check=popularity_check)))
             # Yield to avoid starving of sub-tasks. Prefer depth-first work-order scheduling over breadth-first.
             # Namely, allow download of the 1st project before finishing scraping data on all projects.
             await asyncio.sleep(1)
         await asyncio.gather(*tasks)
 
-    async def scrape_and_prepare_repository_if_popular(
+    async def scrape_and_prepare_repository_conditionally(
             self, owner_name: str, repository_name: str, output_dir_path: str,
-            repository_dict: Optional[dict] = None):
-        repository_info = await self.get_repository_info(
-            owner_name=owner_name, repository_name=repository_name, repo_dict=repository_dict)
-        if self.is_repo_considered_popular(repo_info=repository_info) and repository_info.java_language_freq > 0.7:
-            await self.scrape_and_prepare_repository(
-                owner_name=owner_name, repository_name=repository_name,
-                branch_name=repository_info.default_branch, output_dir_path=output_dir_path)
+            repository_dict: Optional[dict] = None, file_extensions: Optional[List[str]] = None,
+            main_language: Optional[str] = None, min_main_language_freq: Optional[float] = None,
+            popularity_check: bool = True):
+        if main_language is not None and \
+                (not repository_dict['language'] or
+                 repository_dict['language'].lower() != main_language.lower()):
+            return
+        if min_main_language_freq is not None:
+            main_language_freq = await self.get_repo_main_language_freq(
+                owner_name=owner_name, repository_name=repository_dict['name'], raise_on_failure=True)
+            if main_language_freq < min_main_language_freq - 2 * sys.float_info.epsilon:
+                return
+        if popularity_check:
+            repository_info = await self.get_repository_info(
+                owner_name=owner_name, repository_name=repository_name, repo_dict=repository_dict)
+            if not self.is_repo_considered_popular(repo_info=repository_info):
+                return
+        await self.scrape_and_prepare_repository(
+            owner_name=owner_name,
+            repository_name=repository_name,
+            branch_name=repository_dict['default_branch'],
+            output_dir_path=output_dir_path,
+            file_extensions=file_extensions)
 
     async def scrape_and_prepare_repository(
             self, owner_name: str, repository_name: str, output_dir_path: str,
-            branch_name: Optional[str] = None):
+            branch_name: Optional[str] = None, file_extensions: Optional[List[str]] = None):
         if branch_name is None:
             branch_name = await self.get_repository_default_branch(
                 owner_name=owner_name, repository_name=repository_name)
@@ -675,15 +710,20 @@ class RawJavaDatasetGitHubScrapper:
             try:
                 # We avoid making too many concurrent IOs to FS.
                 async with self.concurrent_fs_io_processes_sem:
+                    repo_output_dir = os.path.join(output_dir_path, repository_name)
+                    repo_output_dir_path = aiopath.path.AsyncPath(repo_output_dir)
+                    await repo_output_dir_path.mkdir(parents=True, exist_ok=True)
                     async with atempfile.TemporaryDirectory() as tmp_dir:
                         await self.clone_repository(
-                            owner_name=owner_name, repository_name=repository_name,
-                            branch_name=branch_name, target_dir_path=tmp_dir)
-                        repo_output_dir = os.path.join(output_dir_path, repository_name)
-                        repo_output_dir_path = aiopath.path.AsyncPath(repo_output_dir)
-                        await repo_output_dir_path.mkdir(parents=True, exist_ok=True)
-                        await self.recursively_find_and_copy_all_java_files(
-                            look_in_dir_path=tmp_dir, tgt_dir_path=repo_output_dir)
+                            owner_name=owner_name,
+                            repository_name=repository_name,
+                            branch_name=branch_name,
+                            target_zip_dir_path=tmp_dir,
+                            target_unextracted_path=repo_output_dir if file_extensions is None else tmp_dir)
+                        if file_extensions is not None:
+                            await self.recursively_find_and_copy_all_files_with_certain_extension(
+                                look_in_dir_path=tmp_dir, tgt_dir_path=repo_output_dir,
+                                file_extensions=file_extensions)
                     break  # the operation succeeded - no further attempt needed
             except OSError as error:
                 if attempt_nr == self.max_nr_attempts:
@@ -708,12 +748,13 @@ class RawJavaDatasetGitHubScrapper:
 
     async def clone_repository(
             self, owner_name: str, repository_name: str, branch_name: str,
-            target_dir_path: str, chunk_size: int = 65535):
+            target_zip_dir_path: str, target_unextracted_path: Optional[str] = None,
+            chunk_size: int = 65535):
         repo_zip_file_url = f'https://github.com/{owner_name}/{repository_name}/archive/{branch_name}.zip'
         async with self.downloads_session_agent.request(repo_zip_file_url) as response:
             if response is None:
                 raise RuntimeError(f'Could not download repository {owner_name}/{repository_name}:{branch_name}.')
-            zip_file_path = os.path.join(target_dir_path, f'{repository_name}.zip')
+            zip_file_path = os.path.join(target_zip_dir_path, f'{repository_name}.zip')
             async with aiofiles.open(zip_file_path, mode='wb') as zip_file:
                 while True:
                     chunk = await response.content.read(chunk_size)
@@ -721,29 +762,37 @@ class RawJavaDatasetGitHubScrapper:
                         break
                     await zip_file.write(chunk)
             # print('successful file download')
-        unzip_proc = await asyncio.create_subprocess_exec(
-            'unzip', '-o', zip_file_path, '-d', target_dir_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL)
-        await unzip_proc.communicate()
-        exit_code = await unzip_proc.wait()
-        assert exit_code == 0
+        if target_unextracted_path is not None:
+            unzip_proc = await asyncio.create_subprocess_exec(
+                'unzip', '-o', zip_file_path, '-d', target_unextracted_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await unzip_proc.communicate()
+            exit_code = await unzip_proc.wait()
+            assert exit_code == 0
         return
 
-    async def recursively_find_and_copy_all_java_files(self, look_in_dir_path: str, tgt_dir_path: str):
+    async def recursively_find_and_copy_all_files_with_certain_extension(
+            self, look_in_dir_path: str, tgt_dir_path: str, file_extensions: List[str]):
         filename_occurrences: Dict[str, int] = defaultdict(int)
         tasks = []
-        async for java_file_path in AsyncPath(look_in_dir_path).glob('**/*.java'):
-            if not await AsyncPath(java_file_path).is_file():
-                continue
-            filename = os.path.basename(java_file_path)
-            filename_occurrences[filename] += 1
-            if filename_occurrences[filename] > 1:
-                filename = f"{filename.rstrip('.java')}__{filename_occurrences[filename]}.java"
-                assert filename not in filename_occurrences
-            tasks.append(asyncio.create_task(self.ioFileHelper.async_copy_file(
-                source_file_path=java_file_path,
-                dest_file_path=os.path.join(tgt_dir_path, filename))))
+        # note: files might be duplicated if for two file extensions one is a prefix of the other.
+        for file_ext in file_extensions:
+            async for file_path in AsyncPath(look_in_dir_path).glob(f'**/*.{file_ext}'):
+                if not await AsyncPath(file_path).is_file():
+                    continue
+                filename = os.path.basename(file_path)
+                filename_occurrences[filename] += 1
+                if filename_occurrences[filename] > 1:
+                    # matching_extensions = tuple(ext for ext in file_extensions if filename.endswith(f'.{ext}'))
+                    # assert len(matching_extensions) > 0
+                    # file_extension = max(matching_extensions, key=len)
+                    filename = f"{filename.rstrip(f'.{file_ext}')}__" \
+                               f"{filename_occurrences[filename]}.{file_ext}"
+                    assert filename not in filename_occurrences
+                tasks.append(asyncio.create_task(self.ioFileHelper.async_copy_file(
+                    source_file_path=file_path,
+                    dest_file_path=os.path.join(tgt_dir_path, filename))))
         await asyncio.gather(*tasks)
 
     async def close(self):
@@ -755,20 +804,26 @@ class RawJavaDatasetGitHubScrapper:
 async def async_main():
     parser = create_argparser()
     args = parser.parse_args()
-    scrapper = RawJavaDatasetGitHubScrapper(user=args.user, token=args.token)
+    scrapper = GitHubScrapper(user=args.user, token=args.token)
     try:
         if args.repository_names is None:
             await scrapper.scrape_and_prepare_owners(
                 owner_names=args.owner_names,
                 output_dir_path=args.output_dir_path,
-                popularity_check=not args.no_popularity_check)
+                popularity_check=not args.no_popularity_check,
+                main_language=args.main_language,
+                min_main_language_freq=args.min_main_language_freq,
+                file_extensions=args.file_extensions)
         else:
             assert len(args.owner_names) == 1
             await scrapper.scrape_and_prepare_owner(
                 owner_name=args.owner_names[0],
                 repository_names=args.repository_names,
                 output_dir_path=args.output_dir_path,
-                popularity_check=not args.no_popularity_check)
+                popularity_check=not args.no_popularity_check,
+                main_language=args.main_language,
+                min_main_language_freq=args.min_main_language_freq,
+                file_extensions=args.file_extensions)
     finally:
         await scrapper.close()
 
@@ -785,8 +840,11 @@ def create_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--repos', type=str, required=False, nargs='+', dest='repository_names')
     parser.add_argument('--no-popularity-check', action='store_true', dest='no_popularity_check')
     parser.add_argument('--output-dir', type=str, required=True, dest='output_dir_path')
-    parser.add_argument('--user', type=str, dest='user')
-    parser.add_argument('--token', type=str, dest='token')
+    parser.add_argument('--user', type=str, required=False, dest='user')
+    parser.add_argument('--token', type=str, required=False, dest='token')
+    parser.add_argument('--main-language', type=str, required=False, dest='main_language')
+    parser.add_argument('--main-language-freq', type=float, required=False, dest='min_main_language_freq')
+    parser.add_argument('--extensions', type=str, required=False, dest='file_extensions', nargs='+')
     return parser
 
 
