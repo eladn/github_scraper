@@ -728,6 +728,8 @@ class RawJavaDatasetGitHubScrapper:
         filename_occurrences: Dict[str, int] = defaultdict(int)
         tasks = []
         async for java_file_path in AsyncPath(look_in_dir_path).glob('**/*.java'):
+            if not await AsyncPath(java_file_path).is_file():
+                continue
             filename = os.path.basename(java_file_path)
             filename_occurrences[filename] += 1
             if filename_occurrences[filename] > 1:
