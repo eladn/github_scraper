@@ -35,8 +35,8 @@ class GitHubScrapper:
             token: Optional[str] = None,
             max_nr_concurrent_api_requests: int = 5,
             max_concurrent_downloads: int = 5,
-            max_nr_attempts: int = 5,
-            max_nr_concurrent_fs_ios: int = 10):
+            max_nr_concurrent_fs_ios: int = 10,
+            max_nr_attempts: int = 5):
         self.max_nr_attempts = max_nr_attempts
         self.api_session_agent = SessionAgent(
             auth=aiohttp.BasicAuth(user, token) if user and token else None,
@@ -490,7 +490,12 @@ async def _pre_solved_coroutine(result):
 async def async_main():
     parser = create_argparser()
     args = parser.parse_args()
-    scrapper = GitHubScrapper(user=args.user, token=args.token)
+    scrapper = GitHubScrapper(
+        user=args.user, token=args.token,
+        max_nr_concurrent_api_requests=args.max_nr_concurrent_api_requests,
+        max_concurrent_downloads=args.max_concurrent_downloads,
+        max_nr_concurrent_fs_ios=args.max_nr_concurrent_fs_ios,
+        max_nr_attempts=args.max_nr_attempts)
     try:
         if args.repository_names is None:
             await scrapper.scrape_and_prepare_owners(
@@ -531,6 +536,14 @@ def create_argparser() -> argparse.ArgumentParser:
     parser.add_argument('--main-language', type=str, required=False, dest='main_language')
     parser.add_argument('--main-language-freq', type=float, required=False, dest='min_main_language_freq')
     parser.add_argument('--extensions', type=str, required=False, dest='file_extensions', nargs='+')
+    parser.add_argument('--concurrent-api-reqs', type=int, required=False,
+                        dest='max_nr_concurrent_api_requests', default=5)
+    parser.add_argument('--concurrent-downloads', type=int, required=False,
+                        dest='max_concurrent_downloads', default=5)
+    parser.add_argument('--concurrent-fs-ios', type=int, required=False,
+                        dest='max_nr_concurrent_fs_ios', default=10)
+    parser.add_argument('--attempts', type=int, required=False,
+                        dest='max_nr_attempts', default=5)
     return parser
 
 
