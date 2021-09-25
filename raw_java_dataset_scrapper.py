@@ -23,18 +23,18 @@ from aiopath import AsyncPath
 
 @dataclasses.dataclass(frozen=True)
 class GithubRepositoryInfo:
-    nr_contributors: Optional[int]
-    nr_stars: Optional[int]
-    nr_commits: Optional[int]
-    nr_tags: Optional[int]
-    nr_forks: Optional[int]
-    nr_branches: Optional[int]
-    nr_watchers: Optional[int]
-    network_count: Optional[int]
-    subscribers_count: Optional[int]
-    java_language_freq: Optional[float]
-    last_commits_avg_time_delta: Optional[datetime.timedelta]
-    default_branch: Optional[str]
+    nr_contributors: Optional[int] = None
+    nr_stars: Optional[int] = None
+    nr_commits: Optional[int] = None
+    nr_tags: Optional[int] = None
+    nr_forks: Optional[int] = None
+    nr_branches: Optional[int] = None
+    nr_watchers: Optional[int] = None
+    network_count: Optional[int] = None
+    subscribers_count: Optional[int] = None
+    java_language_freq: Optional[float] = None
+    last_commits_avg_time_delta: Optional[datetime.timedelta] = None
+    default_branch: Optional[str] = None
 
 
 class IOFileHelper:
@@ -284,18 +284,16 @@ class RawJavaDatasetGitHubScrapper:
 
     def is_repo_considered_popular(self, repo_info: GithubRepositoryInfo) -> bool:
         repo_info_relaxed_conditions = GithubRepositoryInfo(
-            nr_contributors=None,
+            nr_contributors=5,
             nr_stars=40,
             nr_commits=3000,
-            nr_tags=None,
-            nr_forks=None,
-            nr_branches=None,
-            nr_watchers=None,
+            nr_tags=5,
+            nr_forks=10,
+            nr_branches=5,
+            nr_watchers=10,
             network_count=None,
             subscribers_count=None,
-            java_language_freq=0.7,
             last_commits_avg_time_delta=datetime.timedelta(days=-4*30),
-            default_branch=None
         )
         repo_info_moderate_conditions = GithubRepositoryInfo(
             nr_contributors=20,
@@ -307,23 +305,19 @@ class RawJavaDatasetGitHubScrapper:
             nr_watchers=50,
             network_count=None,
             subscribers_count=None,
-            java_language_freq=None,
             last_commits_avg_time_delta=datetime.timedelta(days=-1.5*30),
-            default_branch=None
         )
         repo_info_strict_conditions = GithubRepositoryInfo(
-            nr_contributors=50,
-            nr_stars=200,
-            nr_commits=7000,
-            nr_tags=30,
+            nr_contributors=80,
+            nr_stars=2_000,
+            nr_commits=7_000,
+            nr_tags=80,
             nr_forks=100,
             nr_branches=30,
-            nr_watchers=100,
+            nr_watchers=200,
             network_count=None,
             subscribers_count=None,
-            java_language_freq=None,
             last_commits_avg_time_delta=datetime.timedelta(days=-5),
-            default_branch=None
         )
 
         def check_conditions(conditions: GithubRepositoryInfo) -> Iterable[bool]:
@@ -344,12 +338,12 @@ class RawJavaDatasetGitHubScrapper:
             else:
                 return mean_accumulator
 
-        relaxed_conjunction = all(check_conditions(repo_info_relaxed_conditions))
-        strict_disjunction = all(check_conditions(repo_info_strict_conditions))
-        moderate_majority = mean(check_conditions(repo_info_moderate_conditions)) > 0.5 - sys.float_info.epsilon
+        relaxed_conjunction = mean(check_conditions(repo_info_relaxed_conditions)) > 0.75 - 2 * sys.float_info.epsilon
+        moderate_majority = mean(check_conditions(repo_info_moderate_conditions)) > 0.5 - 2 * sys.float_info.epsilon
+        strict_disjunction = mean(check_conditions(repo_info_strict_conditions)) > 0.2 - 2 * sys.float_info.epsilon
         is_repo_popular = \
             mean((relaxed_conjunction, strict_disjunction, moderate_majority)) > 0.5 - sys.float_info.epsilon
-        # print('is_repo_popular', is_repo_popular)
+        # print('is_repo_popular', is_repo_popular, relaxed_conjunction, strict_disjunction, moderate_majority)
         return is_repo_popular
 
     async def find_all_java_repositories_of_owner(self, owner_name: str) -> AsyncIterable[dict]:
@@ -665,7 +659,7 @@ class RawJavaDatasetGitHubScrapper:
             repository_dict: Optional[dict] = None):
         repository_info = await self.get_repository_info(
             owner_name=owner_name, repository_name=repository_name, repo_dict=repository_dict)
-        if self.is_repo_considered_popular(repo_info=repository_info):
+        if self.is_repo_considered_popular(repo_info=repository_info) and repository_info.java_language_freq > 0.7:
             await self.scrape_and_prepare_repository(
                 owner_name=owner_name, repository_name=repository_name,
                 branch_name=repository_info.default_branch, output_dir_path=output_dir_path)
