@@ -113,6 +113,8 @@ class SessionAgent:
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_wakeup_time = datetime.datetime.now()
         self.nr_consecutive_failed_unblocking_attempts = -1
+        self.nr_blocking_reasons_changes_during_consecutive_failed_unblocking_attempts = 0
+        self.last_blocking_reason = None
         self.background_resources_closing_waiter = AsyncBackgroundWaiter()
 
     def create_session(self):
@@ -172,28 +174,38 @@ class SessionAgent:
         for under_limit_wake_up_event in under_limit_wake_up_events:
             under_limit_wake_up_event.set()
 
-    async def _block_all_incoming_requests(self, blocking_reason: str) -> bool:
+    async def _block_all_incoming_requests(self, blocking_reason_kind, blocking_reason_msg: str) -> bool:
         if self.is_incoming_requests_blocked:
             return False
         # Note: only one async coroutine can pass this condition, as there is no preemption in this point.
         self.is_incoming_requests_blocked = True
+        if self.last_blocking_reason != blocking_reason_kind and self.nr_consecutive_failed_unblocking_attempts >= 0:
+            # If last blocking was due to another reason - reset the consecutive failed attempts counter; except for
+            # the case when the blocking reason changed too many times during consecutive failed unblocking attempts.
+            self.nr_blocking_reasons_changes_during_consecutive_failed_unblocking_attempts += 1
+            if self.nr_blocking_reasons_changes_during_consecutive_failed_unblocking_attempts < 3:
+                self.nr_consecutive_failed_unblocking_attempts = -1
+        self.last_blocking_reason = blocking_reason_kind
         self.nr_consecutive_failed_unblocking_attempts += 1
         failed_wakeups_count_msg_str = \
             f' (after {self.nr_consecutive_failed_unblocking_attempts} failed wakeup attempts)' \
                 if self.nr_consecutive_failed_unblocking_attempts > 0 else ''
         print(f'Temporarily blocking all incoming requests{failed_wakeups_count_msg_str}. '
-              f'Blocking reason: {blocking_reason}.')
+              f'Blocking reason: {blocking_reason_msg}.')
         asyncio.create_task(self._release_incoming_requests_blocking())
         return True
 
     async def _block_all_incoming_requests_if_limit_reached(self, response_status: int) -> bool:
         if response_status != self.reached_req_limit_http_response_status_code:
             return False
-        await self._block_all_incoming_requests('Limit reached')
+        await self._block_all_incoming_requests(
+            blocking_reason_kind='limit_reached', blocking_reason_msg='Limit reached')
         return True
 
-    async def _block_all_incoming_requests_due_to_client_error(self, error: aiohttp.ClientError):
-        am_i_the_blocker = await self._block_all_incoming_requests(f'Client error: {error}')
+    async def _block_all_incoming_requests_due_to_client_error(
+            self, error: Union[aiohttp.ClientError, asyncio.TimeoutError]):
+        am_i_the_blocker = await self._block_all_incoming_requests(
+            blocking_reason_kind=error.__class__.__name__, blocking_reason_msg=f'Client error: {error}')
         if am_i_the_blocker:
             # Make the first requestor (after un-blocking) re-create the session.
             self.schedule_session_close_if_opened()
@@ -224,6 +236,7 @@ class SessionAgent:
                                 if last_wakeup_time_before_req == self.last_wakeup_time:
                                     # no limit reached, hence we can reset the failed wakeup attempts count.
                                     self.nr_consecutive_failed_unblocking_attempts = -1
+                                    self.nr_blocking_reasons_changes_during_consecutive_failed_unblocking_attempts = 0
                                 if response.status != 200:
                                     break  # like "continue" for outer loop - counts as a failed attempt
                                 if json:
