@@ -102,8 +102,10 @@ class SessionAgent:
             self,
             auth: Optional[aiohttp.BasicAuth] = None,
             max_nr_concurrent_requests: int = 5,
-            max_nr_attempts: int = 5):
+            max_nr_attempts: int = 5,
+            reached_req_limit_http_response_status_code: int = 403):
         self.auth = auth
+        self.reached_req_limit_http_response_status_code = reached_req_limit_http_response_status_code
         self.is_incoming_requests_blocked = False
         self.under_limit_wake_up_events = []
         self.concurrent_api_requests_sem = asyncio.BoundedSemaphore(max_nr_concurrent_requests)
@@ -185,7 +187,7 @@ class SessionAgent:
         return True
 
     async def _block_all_incoming_requests_if_limit_reached(self, response_status: int) -> bool:
-        if response_status != 403:
+        if response_status != self.reached_req_limit_http_response_status_code:
             return False
         await self._block_all_incoming_requests('Limit reached')
         return True
