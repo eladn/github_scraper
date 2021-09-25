@@ -50,8 +50,51 @@ class IOFileHelper:
                     await dest.write(chunk)
 
 
-async def _dummy_coroutine(result):
+async def _pre_solved_coroutine(result):
     return result
+
+
+class AsyncBackgroundWaiter:
+    def __init__(self):
+        self._next_waiter_id = 0
+        self._wait_for = {}
+        self._finished_waiters_ids_that_should_be_deleted = set()
+        self._finished_sem = asyncio.Semaphore(0)
+        self._background_finished_collector_task: Optional[asyncio.Task] = None
+
+    def add_coroutine(self, coroutine):
+        waiter_id = self._next_waiter_id
+        self._next_waiter_id += 1
+        assert waiter_id not in self._wait_for
+        self._wait_for[waiter_id] = asyncio.create_task(self._single_task_waiter(coroutine, waiter_id))
+        if self._background_finished_collector_task is None:
+            self._background_finished_collector_task = asyncio.create_task(
+                self._background_finished_waiters_tasks_collector())
+
+    async def close(self):
+        if self._background_finished_collector_task is None or self._background_finished_collector_task.done():
+            return
+        assert not self._background_finished_collector_task.cancelled()
+        await self._background_finished_collector_task
+        assert len(self._wait_for) == 0
+
+    async def _single_task_waiter(self, coroutine, waiter_id: int):
+        await coroutine
+        self._finished_waiters_ids_that_should_be_deleted.add(waiter_id)
+        # signal the `_background_finished_waiters_tasks_collector` this task should be collected
+        self._finished_sem.release()
+
+    async def _background_finished_waiters_tasks_collector(self):
+        # The `_single_task_waiter`s cannot remove themselves from the wait list. Instead, they signal that they
+        # are done and we remove them here so the `wait_for` collection won't get huge over time.
+        while len(self._wait_for):
+            await self._finished_sem.acquire()
+            assert len(self._finished_waiters_ids_that_should_be_deleted) > 0
+            waiter_id = self._finished_waiters_ids_that_should_be_deleted.pop()
+            assert waiter_id in self._wait_for
+            waiter_task = self._wait_for.pop(waiter_id)
+            if not waiter_task.done():
+                await waiter_task
 
 
 class SessionAgent:
@@ -67,23 +110,37 @@ class SessionAgent:
         self.max_nr_attempts = max_nr_attempts
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_wakeup_time = datetime.datetime.now()
-        self.nr_consecutive_failed_wakeup_attempts_after_limit_reached = -1
+        self.nr_consecutive_failed_unblocking_attempts = -1
+        self.background_resources_closing_waiter = AsyncBackgroundWaiter()
 
-    async def create_session(self):
-        await self.close_session_if_opened()
-        self.session = aiohttp.ClientSession(auth=self.auth)
+    def create_session(self):
+        # Note: only one concurrent coroutine can replace the session
+        self.schedule_session_close_if_opened()
+        if self.session is None:
+            self.session = aiohttp.ClientSession(auth=self.auth)
 
     async def get_session(self) -> aiohttp.ClientSession:
-        while self.session is None:
-            await self.create_session()
+        # Note: The `while` loop should be used if the create_session() was async and it could lead to a case where we
+        #       would back-scheduled here only after the session does not exist anymore even we created it.
+        # while self.session is None:
+        #     self.create_session()
+        if self.session is None:
+            self.create_session()
         assert self.session is not None
         return self.session
 
-    async def close_session_if_opened(self):
+    async def close(self):
+        self.schedule_session_close_if_opened()
+        await self.background_resources_closing_waiter.close()
+
+    def schedule_session_close_if_opened(self):
+        # Note: only one concurrent coroutine can enter the condition
         session = self.session
         if session is not None:
             self.session = None
-            await session.close()
+            # Schedule the close without waiting for it. We don't want to block a request because of
+            # waiting for a session to be closed.
+            self.background_resources_closing_waiter.add_coroutine(session.close())
 
     async def _wait_if_requests_blocked(self):
         if not self.is_incoming_requests_blocked:
@@ -95,7 +152,7 @@ class SessionAgent:
     async def _release_incoming_requests_blocking(self):
         assert self.is_incoming_requests_blocked
         max_wait_time = 60 * 2
-        sleep_time = min(15 * 2 ** self.nr_consecutive_failed_wakeup_attempts_after_limit_reached, max_wait_time)
+        sleep_time = min(15 * 2 ** self.nr_consecutive_failed_unblocking_attempts, max_wait_time)
         print(f'Incoming requests will be unblocked within {sleep_time} seconds ..')
         await asyncio.sleep(sleep_time)
         assert self.is_incoming_requests_blocked
@@ -113,22 +170,35 @@ class SessionAgent:
         for under_limit_wake_up_event in under_limit_wake_up_events:
             under_limit_wake_up_event.set()
 
+    async def _block_all_incoming_requests(self, blocking_reason: str) -> bool:
+        if self.is_incoming_requests_blocked:
+            return False
+        # Note: only one async coroutine can pass this condition, as there is no preemption in this point.
+        self.is_incoming_requests_blocked = True
+        self.nr_consecutive_failed_unblocking_attempts += 1
+        failed_wakeups_count_msg_str = \
+            f' (after {self.nr_consecutive_failed_unblocking_attempts} failed wakeup attempts)' \
+                if self.nr_consecutive_failed_unblocking_attempts > 0 else ''
+        print(f'Temporarily blocking all incoming requests{failed_wakeups_count_msg_str}. '
+              f'Blocking reason: {blocking_reason}.')
+        asyncio.create_task(self._release_incoming_requests_blocking())
+        return True
+
     async def _block_all_incoming_requests_if_limit_reached(self, response_status: int) -> bool:
         if response_status != 403:
             return False
-        if not self.is_incoming_requests_blocked:
-            # Note: only one async coroutine can pass this condition, as there is no preemption in this point.
-            self.is_incoming_requests_blocked = True
-            self.nr_consecutive_failed_wakeup_attempts_after_limit_reached += 1
-            failed_wakeups_count_msg_str = \
-                f'(after {self.nr_consecutive_failed_wakeup_attempts_after_limit_reached} failed wakeup attempts)' \
-                    if self.nr_consecutive_failed_wakeup_attempts_after_limit_reached > 0 else ''
-            print(f'Limit reached. Temporarily blocking all incoming requests {failed_wakeups_count_msg_str}..')
-            asyncio.create_task(self._release_incoming_requests_blocking())
+        await self._block_all_incoming_requests('Limit reached')
         return True
 
+    async def _block_all_incoming_requests_due_to_client_error(self, error: aiohttp.ClientError):
+        am_i_the_blocker = await self._block_all_incoming_requests(f'Client error: {error}')
+        if am_i_the_blocker:
+            # Make the first requestor (after un-blocking) re-create the session.
+            self.schedule_session_close_if_opened()
+
     @asynccontextmanager
-    async def request(self, url, method='get', json: bool = False, body=None, headers=None):
+    async def request(
+            self, url, method='get', json: bool = False, body=None, headers=None, raise_on_failure: bool = True):
         request_additional_kwargs = {}
         if body is not None:
             request_additional_kwargs['body'] = body
@@ -139,30 +209,42 @@ class SessionAgent:
             if attempt_nr > 0:
                 await asyncio.sleep(5 * attempt_nr)
             while True:
-                async with self.concurrent_api_requests_sem:
-                    await self._wait_if_requests_blocked()
-                    session = await self.get_session()
-                    last_wakeup_time_before_req = self.last_wakeup_time
-                    async with session.request(method=method, url=url, **request_additional_kwargs) as response:
-                        is_requests_limit_reached = \
-                            await self._block_all_incoming_requests_if_limit_reached(response.status)
-                        if is_requests_limit_reached:
+                    async with self.concurrent_api_requests_sem:
+                        await self._wait_if_requests_blocked()
+                        try:
+                            session = await self.get_session()
+                            last_wakeup_time_before_req = self.last_wakeup_time
+                            async with session.request(method=method, url=url, **request_additional_kwargs) as response:
+                                is_requests_limit_reached = \
+                                    await self._block_all_incoming_requests_if_limit_reached(response.status)
+                                if is_requests_limit_reached:
+                                    continue  # inner loop - don't count as a failed attempt
+                                if last_wakeup_time_before_req == self.last_wakeup_time:
+                                    # no limit reached, hence we can reset the failed wakeup attempts count.
+                                    self.nr_consecutive_failed_unblocking_attempts = -1
+                                if response.status != 200:
+                                    break  # like "continue" for outer loop - counts as a failed attempt
+                                if json:
+                                    try:
+                                        json = await response.json()
+                                        yield response, json
+                                        return
+                                    except:
+                                        break  # like "continue" for outer loop - counts as a failed attempt
+                                else:
+                                    yield response
+                                    return
+                        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                            await self._block_all_incoming_requests_due_to_client_error(error)
                             continue  # inner loop - don't count as a failed attempt
-                        if last_wakeup_time_before_req == self.last_wakeup_time:
-                            # no limit reached, hence we can reset the failed wakeup attempts count.
-                            self.nr_consecutive_failed_wakeup_attempts_after_limit_reached = -1
-                        if response.status != 200:
-                            break  # like "continue" for outer loop - counts as a failed attempt
-                        if json:
-                            try:
-                                json = await response.json()
-                                yield response, json
-                                return
-                            except:
-                                break  # like "continue" for outer loop - counts as a failed attempt
-                        else:
-                            yield response
-                            return
+                        except asyncio.CancelledError as error:
+                            # The used session might have been closed by another failed request that triggered
+                            # blocking. In such case we might reach here.
+                            continue  # inner loop - don't count as a failed attempt
+
+        if raise_on_failure:
+            raise RuntimeError(f'Maximum attempts reached for request `{url}`.')
+        yield None
         return
 
 
@@ -289,13 +371,20 @@ class RawJavaDatasetGitHubScrapper:
         assert last_page_nr >= 1
         return last_page_nr
 
-    async def _get_nr_pages_for_paginated_api_call(self, api_req_url: str) -> Optional[int]:
+    async def _get_nr_items_for_paginated_api_call(
+            self, api_req_url: str, raise_on_failure: bool = True) -> Optional[int]:
+        return await self._get_nr_pages_for_paginated_api_call(
+            api_req_url=api_req_url, page_size=1, raise_on_failure=raise_on_failure)
+
+    async def _get_nr_pages_for_paginated_api_call(
+            self, api_req_url: str, page_size: int = 1, raise_on_failure: bool = True) -> Optional[int]:
         first_page_url = self._get_url_for_page(
-            api_req_url=api_req_url, page_size=1, page_nr=1)
-        async with self._api_call(first_page_url) as first_page_res:
+            api_req_url=api_req_url, page_size=page_size, page_nr=1)
+        async with self._api_call(first_page_url, raise_on_failure=raise_on_failure) as first_page_res:
             if first_page_res is None:
+                assert not raise_on_failure
                 return None
-            return self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res) + 1
+            return self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res)
 
     async def _paginated_list_api_call(
             self, api_req_url: str,
@@ -323,9 +412,8 @@ class RawJavaDatasetGitHubScrapper:
                 if max_nr_items is not None and nr_yielded_items >= max_nr_items:
                     return
                 res_json = await self._json_api_call(self._get_url_for_page(
-                    api_req_url=api_req_url, page_size=page_size, page_nr=page_nr))
-                if res_json is None:
-                    raise RuntimeError(f'Could not fetch page {page_nr}.')
+                    api_req_url=api_req_url, page_size=page_size, page_nr=page_nr), raise_on_failure=True)
+                assert res_json is not None
                 assert isinstance(res_json, list)
                 if len(res_json) < 1:
                     return  # previous page was the last one
@@ -337,12 +425,11 @@ class RawJavaDatasetGitHubScrapper:
         else:
             assert nr_pages_prefetch > 0
             first_page_url = self._get_url_for_page(api_req_url=api_req_url, page_size=page_size, page_nr=1)
-            async with self._api_call(first_page_url, json=True) as first_page_ret:
-                if first_page_ret is None:
-                    raise RuntimeError(f'Could not fetch first page.')
+            async with self._api_call(first_page_url, json=True, raise_on_failure=True) as first_page_ret:
+                assert first_page_ret is not None
                 first_page_res, first_page_json = first_page_ret
                 last_page_nr = self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res)
-                first_page_res_task = asyncio.create_task(_dummy_coroutine(first_page_json))
+                first_page_res_task = asyncio.create_task(_pre_solved_coroutine(first_page_json))
 
             if max_nr_items is not None:
                 last_page_nr = min(last_page_nr, int(math.ceil(max_nr_items / page_size)))
@@ -355,16 +442,16 @@ class RawJavaDatasetGitHubScrapper:
                     assert page_nr_to_prefetch not in pages_tasks
                     pages_tasks[page_nr_to_prefetch] = \
                         asyncio.create_task(self._json_api_call(self._get_url_for_page(
-                            api_req_url=api_req_url, page_size=page_size, page_nr=page_nr_to_prefetch)))
+                            api_req_url=api_req_url, page_size=page_size, page_nr=page_nr_to_prefetch),
+                            raise_on_failure=False))
                 assert page_nr in pages_tasks
                 page_task = pages_tasks[page_nr]
                 page_json_res = page_task.result() if page_task.done() else await page_task  # avoid awaiting twice
                 if page_json_res is None:
-                    # Prefetch failed (maybe too many attempts). Here we give it a second change.
+                    # Prefetch failed. Here we give it a second change.
                     page_json_res = await self._json_api_call(self._get_url_for_page(
-                        api_req_url=api_req_url, page_size=page_size, page_nr=page_nr))
-                    if page_json_res is None:
-                        raise RuntimeError(f'Could not fetch page {page_nr}.')
+                        api_req_url=api_req_url, page_size=page_size, page_nr=page_nr), raise_on_failure=True)
+                    assert page_json_res is not None
                 assert page_json_res is not None
                 assert isinstance(page_json_res, list)
                 assert len(page_json_res) > 0
@@ -375,33 +462,36 @@ class RawJavaDatasetGitHubScrapper:
                         return
 
     async def _get_item_by_index_from_paginated_list_api_call(
-            self, api_req_url: str, item_index: int) -> Optional[Union[dict, list]]:
-        async with self._api_call(self._get_url_for_page(
-                api_req_url=api_req_url, page_size=1, page_nr=1)) as first_page_res:
-            if first_page_res is None:
-                return None
-            last_page_nr = self._extract_nr_pages_from_paginated_list_api_call_response(first_page_res)
+            self, api_req_url: str, item_index: int, raise_on_failure: bool = True) -> Optional[Union[dict, list]]:
+        last_page_nr = await self._get_nr_items_for_paginated_api_call(
+            api_req_url=api_req_url, raise_on_failure=raise_on_failure)
         wanted_page_nr = last_page_nr - item_index
         assert wanted_page_nr >= 1
-        wanted_page_res = await self._json_api_call(self._get_url_for_page(
-            api_req_url=api_req_url, page_size=1, page_nr=wanted_page_nr))
+        wanted_page_url = self._get_url_for_page(
+            api_req_url=api_req_url, page_size=1, page_nr=wanted_page_nr)
+        wanted_page_res = await self._json_api_call(wanted_page_url, raise_on_failure=raise_on_failure)
+        if wanted_page_res is None:
+            assert not raise_on_failure
+            return None
         assert isinstance(wanted_page_res, list)
         assert len(wanted_page_res) == 1
         return wanted_page_res[0]
 
-    async def _json_api_call(self, api_req_url: str) -> Optional[Union[list, dict]]:
-        async with self.api_session_agent.request(api_req_url, json=True) as ret:
+    async def _json_api_call(self, api_req_url: str, raise_on_failure: bool = True) -> Optional[Union[list, dict]]:
+        async with self.api_session_agent.request(api_req_url, json=True, raise_on_failure=raise_on_failure) as ret:
             if ret is None:
+                assert not raise_on_failure
                 return None
             print('successful json api request')
             resp, json = ret
             return json
 
     @asynccontextmanager
-    async def _api_call(self, api_req_url: str, json: bool = False) -> Optional[aiohttp.ClientResponse]:
-        async with self.api_session_agent.request(api_req_url, json=json) as ret:
+    async def _api_call(self, api_req_url: str, json: bool = False, raise_on_failure: bool = True) \
+            -> Optional[aiohttp.ClientResponse]:
+        async with self.api_session_agent.request(api_req_url, json=json, raise_on_failure=raise_on_failure) as ret:
             if ret is None:
-                # TODO: what do we do in this case?
+                assert not raise_on_failure
                 yield None
                 return
             print('successful api request')
@@ -417,30 +507,32 @@ class RawJavaDatasetGitHubScrapper:
         commits_compare_url = \
             f'https://api.github.com/repos/{owner_name}/{repository_name}/compare/' \
             f'{first_commit_sha}...{last_commit_sha}'
-        commits_compare = await self._json_api_call(commits_compare_url)
+        commits_compare = await self._json_api_call(commits_compare_url, raise_on_failure=True)
         assert 'total_commits' in commits_compare
         return int(commits_compare['total_commits']) + 1
 
     async def get_repository_nr_commits(self, owner_name: str, repository_name: str) -> int:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
-        return await self._get_nr_pages_for_paginated_api_call(f'{api_info_req_url}/commits')
+        return await self._get_nr_items_for_paginated_api_call(f'{api_info_req_url}/commits')
 
     async def get_repository_nr_branches(self, owner_name: str, repository_name: str) -> int:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
-        return await self._get_nr_pages_for_paginated_api_call(f'{api_info_req_url}/branches')
+        return await self._get_nr_items_for_paginated_api_call(f'{api_info_req_url}/branches')
 
     async def get_repository_nr_contributors(self, owner_name: str, repository_name: str) -> int:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
-        return await self._get_nr_pages_for_paginated_api_call(f'{api_info_req_url}/contributors')
+        return await self._get_nr_items_for_paginated_api_call(f'{api_info_req_url}/contributors')
 
     async def get_repository_nr_tags(self, owner_name: str, repository_name: str) -> int:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
-        return await self._get_nr_pages_for_paginated_api_call(f'{api_info_req_url}/tags')
+        return await self._get_nr_items_for_paginated_api_call(f'{api_info_req_url}/tags')
 
-    async def get_repository_default_branch(self, owner_name: str, repository_name: str) -> Optional[str]:
+    async def get_repository_default_branch(
+            self, owner_name: str, repository_name: str, raise_on_failure: bool = True) -> Optional[str]:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
-        repo_info_dict = await self._json_api_call(api_info_req_url)
+        repo_info_dict = await self._json_api_call(api_info_req_url, raise_on_failure=raise_on_failure)
         if repo_info_dict is None:
+            assert not raise_on_failure
             return None
         return repo_info_dict['default_branch']
 
@@ -449,7 +541,7 @@ class RawJavaDatasetGitHubScrapper:
             repo_dict: Optional[dict] = None) -> Optional[GithubRepositoryInfo]:
         api_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
         requests_coroutines = {
-            'repo_languages_dict': self._json_api_call(f'{api_info_req_url}/languages'),
+            'repo_languages_dict': self._json_api_call(f'{api_info_req_url}/languages', raise_on_failure=True),
             'repo_nr_contributors': self.get_repository_nr_contributors(
                 owner_name=owner_name, repository_name=repository_name),
             'repo_nr_tags': self.get_repository_nr_tags(
@@ -517,7 +609,7 @@ class RawJavaDatasetGitHubScrapper:
 
     async def get_repository_data(self, owner_name: str, repository_name: str) -> dict:
         api_repo_info_req_url = f'https://api.github.com/repos/{owner_name}/{repository_name}'
-        repo_dict = await self._json_api_call(api_repo_info_req_url)
+        repo_dict = await self._json_api_call(api_repo_info_req_url, raise_on_failure=True)
         return repo_dict
 
     async def iterate_repositories_data(self, owner_name: str, repository_names: List[str]) -> AsyncIterable[dict]:
@@ -595,6 +687,15 @@ class RawJavaDatasetGitHubScrapper:
                     warn(f'OS Error [{error.errno}] occurred while trying to clone & prepare '
                          f'repository `{repository_long_name}` (after {attempt_nr}/{self.max_nr_attempts} attempts). '
                          f'Error: {error}')
+            except asyncio.TimeoutError as error:
+                if attempt_nr == self.max_nr_attempts:
+                    raise RuntimeError(f'Could not clone & prepare repository `{repository_long_name}` '
+                                       f'due to a timeout error (after {attempt_nr} attempts). '
+                                       f'Error: {error}')
+                else:
+                    warn(f'Timeout error occurred while trying to clone & prepare '
+                         f'repository `{repository_long_name}` (after {attempt_nr}/{self.max_nr_attempts} attempts). '
+                         f'Error: {error}')
 
     async def clone_repository(
             self, owner_name: str, repository_name: str, branch_name: str,
@@ -636,8 +737,8 @@ class RawJavaDatasetGitHubScrapper:
 
     async def close(self):
         await asyncio.gather(*(
-            asyncio.create_task(self.api_session_agent.close_session_if_opened()),
-            asyncio.create_task(self.downloads_session_agent.close_session_if_opened())))
+            asyncio.create_task(self.api_session_agent.close()),
+            asyncio.create_task(self.downloads_session_agent.close())))
 
 
 async def async_main():
