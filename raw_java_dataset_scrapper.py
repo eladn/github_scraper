@@ -61,11 +61,13 @@ class SessionAgent:
             max_nr_concurrent_requests: int = 5,
             max_nr_attempts: int = 5):
         self.auth = auth
-        self.is_under_limit = False
+        self.is_incoming_requests_blocked = False
         self.under_limit_wake_up_events = []
         self.concurrent_api_requests_sem = asyncio.BoundedSemaphore(max_nr_concurrent_requests)
         self.max_nr_attempts = max_nr_attempts
         self.session: Optional[aiohttp.ClientSession] = None
+        self.last_wakeup_time = datetime.datetime.now()
+        self.nr_consecutive_failed_wakeup_attempts_after_limit_reached = -1
 
     async def create_session(self):
         await self.close_session_if_opened()
@@ -83,31 +85,47 @@ class SessionAgent:
             self.session = None
             await session.close()
 
-    async def _before_fence(self):
-        await self.concurrent_api_requests_sem.acquire()
-        if not self.is_under_limit:
+    async def _wait_if_requests_blocked(self):
+        if not self.is_incoming_requests_blocked:
             return
         wake_up_events = asyncio.Event()
         self.under_limit_wake_up_events.append(wake_up_events)
         await wake_up_events.wait()
 
-    async def _after_release(self, response_status: int):
+    async def _release_incoming_requests_blocking(self):
+        assert self.is_incoming_requests_blocked
+        max_wait_time = 60 * 2
+        sleep_time = min(15 * 2 ** self.nr_consecutive_failed_wakeup_attempts_after_limit_reached, max_wait_time)
+        print(f'Incoming requests will be unblocked within {sleep_time} seconds ..')
+        await asyncio.sleep(sleep_time)
+        assert self.is_incoming_requests_blocked
+        print('Unblocking waiting and incoming requests.')
+        # Note: No preemption can happen between unsetting the flag and emptying the list, as preemption
+        #       is possible only if we yield (by an await). Otherwise, it would create a race where
+        #       another coroutine could set the block flag again and another waiting coroutine would
+        #       be added before we empty the list. Just remember that other async functions are not
+        #       allowed to store a local pointer to this list and then yield, as the list might be
+        #       replaced here. Indeed, the waiter only appends itself to this list.
+        self.last_wakeup_time = datetime.datetime.now()
+        self.is_incoming_requests_blocked = False
+        under_limit_wake_up_events = self.under_limit_wake_up_events
+        self.under_limit_wake_up_events = []
+        for under_limit_wake_up_event in under_limit_wake_up_events:
+            under_limit_wake_up_event.set()
+
+    async def _block_all_incoming_requests_if_limit_reached(self, response_status: int) -> bool:
         if response_status != 403:
-            self.concurrent_api_requests_sem.release()
-            return True
-        if not self.is_under_limit:
-            self.under_limit_wake_up_events = []
-            self.is_under_limit = True
-            print('Limit reached. Stopping all upcoming requests for some time..')
-            await asyncio.sleep(60 * 2)
-            print('Woke up.')
-            self.is_under_limit = False
-            under_limit_wake_up_events = self.under_limit_wake_up_events
-            self.under_limit_wake_up_events = []
-            for under_limit_wake_up_event in under_limit_wake_up_events:
-                under_limit_wake_up_event.set()
-        self.concurrent_api_requests_sem.release()
-        return False
+            return False
+        if not self.is_incoming_requests_blocked:
+            # Note: only one async coroutine can pass this condition, as there is no preemption in this point.
+            self.is_incoming_requests_blocked = True
+            self.nr_consecutive_failed_wakeup_attempts_after_limit_reached += 1
+            failed_wakeups_count_msg_str = \
+                f'(after {self.nr_consecutive_failed_wakeup_attempts_after_limit_reached} failed wakeup attempts)' \
+                    if self.nr_consecutive_failed_wakeup_attempts_after_limit_reached > 0 else ''
+            print(f'Limit reached. Temporarily blocking all incoming requests {failed_wakeups_count_msg_str}..')
+            asyncio.create_task(self._release_incoming_requests_blocking())
+        return True
 
     @asynccontextmanager
     async def request(self, url, method='get', json: bool = False, body=None, headers=None):
@@ -121,26 +139,30 @@ class SessionAgent:
             if attempt_nr > 0:
                 await asyncio.sleep(5 * attempt_nr)
             while True:
-                # TODO: use context-manager for the semaphore here!
-                #  currently it could get locked but never released here.
-                await self._before_fence()
-                session = await self.get_session()
-                async with session.request(method=method, url=url, **request_additional_kwargs) as response:
-                    is_limit_ok = await self._after_release(response.status)
-                    if not is_limit_ok:
-                        continue  # inner loop - don't count as a failed attempt
-                    if response.status != 200:
-                        break  # like "continue" for outer loop - counts as a failed attempt
-                    if json:
-                        try:
-                            json = await response.json()
-                            yield response, json
-                            return
-                        except:
+                async with self.concurrent_api_requests_sem:
+                    await self._wait_if_requests_blocked()
+                    session = await self.get_session()
+                    last_wakeup_time_before_req = self.last_wakeup_time
+                    async with session.request(method=method, url=url, **request_additional_kwargs) as response:
+                        is_requests_limit_reached = \
+                            await self._block_all_incoming_requests_if_limit_reached(response.status)
+                        if is_requests_limit_reached:
+                            continue  # inner loop - don't count as a failed attempt
+                        if last_wakeup_time_before_req == self.last_wakeup_time:
+                            # no limit reached, hence we can reset the failed wakeup attempts count.
+                            self.nr_consecutive_failed_wakeup_attempts_after_limit_reached = -1
+                        if response.status != 200:
                             break  # like "continue" for outer loop - counts as a failed attempt
-                    else:
-                        yield response
-                        return
+                        if json:
+                            try:
+                                json = await response.json()
+                                yield response, json
+                                return
+                            except:
+                                break  # like "continue" for outer loop - counts as a failed attempt
+                        else:
+                            yield response
+                            return
         return
 
 
