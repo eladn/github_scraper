@@ -29,7 +29,7 @@ TODO:
 """
 
 
-class GitHubScrapper:
+class GitHubScraper:
     def __init__(
             self, user: Optional[str] = None,
             token: Optional[str] = None,
@@ -490,7 +490,7 @@ async def _pre_solved_coroutine(result):
 async def async_main():
     parser = create_argparser()
     args = parser.parse_args()
-    scrapper = GitHubScrapper(
+    scraper = GitHubScraper(
         user=args.user, token=args.token,
         max_nr_concurrent_api_requests=args.max_nr_concurrent_api_requests,
         max_concurrent_downloads=args.max_concurrent_downloads,
@@ -498,7 +498,7 @@ async def async_main():
         max_nr_attempts=args.max_nr_attempts)
     try:
         if args.repository_names is None:
-            await scrapper.scrape_and_prepare_owners(
+            await scraper.scrape_and_prepare_owners(
                 owner_names=args.owner_names,
                 output_dir_path=args.output_dir_path,
                 popularity_check=not args.no_popularity_check,
@@ -507,7 +507,7 @@ async def async_main():
                 file_extensions=args.file_extensions)
         else:
             assert len(args.owner_names) == 1
-            await scrapper.scrape_and_prepare_owner(
+            await scraper.scrape_and_prepare_owner(
                 owner_name=args.owner_names[0],
                 repository_names=args.repository_names,
                 output_dir_path=args.output_dir_path,
@@ -516,7 +516,7 @@ async def async_main():
                 min_main_language_freq=args.min_main_language_freq,
                 file_extensions=args.file_extensions)
     finally:
-        await scrapper.close()
+        await scraper.close()
 
 
 def sync_main():
