@@ -1,6 +1,18 @@
 # GitHub Scraper
 Python script for scraping GitHub repositories.
 
+## Usage example
+```shell
+python github_scraper.py \
+    --owners apache \
+    --output-dir /Users/eladn/Desktop/hdptest \
+    --token ghp_XxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXxXx \
+    --user myuser \
+    --main-language java \
+    --extensions java \
+    --main-language-freq 0.7
+```
+
 ## Usage
 ```
 usage: github_scraper.py [-h] --owners OWNER_NAMES [OWNER_NAMES ...] [--repos REPOSITORY_NAMES [REPOSITORY_NAMES ...]] [--no-popularity-check]
